@@ -105,4 +105,4 @@ PY
 du -sh "$ROOT" | cut -f1 | xargs echo ">> rootfs size:"
 ls -la "$OUT/engine-$HASH.tar.zst" | awk '{print ">> image:", $5, "bytes"}'
 echo ">> engine sha256 $HASH"
-rm -rf "$WORK"
+unshare -r rm -rf "$WORK"   # rootfs has 0555 dirs and root-owned files
