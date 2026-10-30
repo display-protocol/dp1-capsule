@@ -52,12 +52,20 @@ PKGLIST="$(unshare -r pacman -r "$ROOT" --dbpath "$ROOT/var/lib/pacman" -Q | sor
 echo ">> mount points for the sandbox (ro-bind root needs them to exist)"
 mkdir -p "$ROOT/dev" "$ROOT/proc" "$ROOT/tmp" "$ROOT/work" "$ROOT/out"
 
-echo ">> installing harness"
-install -Dm755 "$HERE/../dp1c.py" "$ROOT/opt/dp1c/dp1c.py"
+echo ">> recording package file hashes (the rebuild recipe: exact bytes, not just versions)"
+PKGSHA="$WORK/pkgsha.txt"; : > "$PKGSHA"
+for f in "$ROOT"/var/cache/pacman/pkg/*.pkg.tar.zst; do [ -f "$f" ] && echo "$(basename "$f") $(sha256sum "$f" | cut -d' ' -f1)" >> "$PKGSHA"; done
+mkdir -p "$ROOT/opt/dp1c"
 cat > "$ROOT/opt/dp1c/ENGINE" <<E
 archive=$DATE
 chromium=$(echo "$PKGLIST" | awk '$1=="chromium"{print $2}')
 E
+
+echo ">> normalizing install-time state (machine id, install dates, logs)"
+unshare -r bash -c 'chmod u+w "$1/etc/machine-id" 2>/dev/null; : > "$1/etc/machine-id"; for d in "$1"/var/lib/pacman/local/*/desc; do sed -i "/^%INSTALLDATE%$/,/^$/d" "$d"; done' _ "$ROOT"
+rm -f "$ROOT/var/lib/pacman/local/ALPM_DB_VERSION.lock" "$ROOT/var/lib/pacman/db.lck" 2>/dev/null || true
+find "$ROOT/var/log" -type f -delete 2>/dev/null || true
+TOOLS="$(printf 'pacman %s; tar %s; zstd %s; python %s' "$(pacman -Q pacman | cut -d" " -f2)" "$(tar --version | head -1 | awk "{print \$NF}")" "$(zstd --version | grep -o 'v[0-9.]*' | head -1)" "$(python3 --version | cut -d" " -f2)")"
 
 echo ">> pruning"
 rm -rf "$ROOT/var/cache/pacman/pkg"/* "$ROOT/usr/share/doc" "$ROOT/usr/share/man" "$ROOT/usr/share/info" \
@@ -68,23 +76,30 @@ TAR="$WORK/engine.tar"
 unshare -r tar --sort=name --mtime='1970-01-01 00:00:00Z' --numeric-owner --owner=0 --group=0 \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
     -C "$ROOT" -cf "$TAR" .
-zstd -q -19 -T0 --no-check -f "$TAR" -o "$WORK/engine.tar.zst"
+zstd -q -19 --single-thread --no-check -f "$TAR" -o "$WORK/engine.tar.zst"   # single thread: the MT encoder is not a stable function of its input
 HASH="$(sha256sum "$WORK/engine.tar.zst" | cut -d' ' -f1)"
 mv "$WORK/engine.tar.zst" "$OUT/engine-$HASH.tar.zst"
 
 printf '%s\n' "$PKGLIST" > "$WORK/pkglist.txt"
-python3 - "$OUT/engine-$HASH.json" "$HASH" "$DATE" "$WORK/pkglist.txt" ${CHROMIUM_URL:+"$CHROMIUM_URL"} <<'PY'
+python3 - "$OUT/engine-$HASH.json" "$HASH" "$DATE" "$WORK/pkglist.txt" "${CHROMIUM_URL:-from snapshot}" "$TOOLS" "$PKGSHA" <<'PY'
 import json, sys
 out, h, date, pkfile = sys.argv[1:5]
 pk = {}
 for line in open(pkfile).read().splitlines():
     n, v = line.split()
     pk[n] = v
+files = {}
+for line in open(sys.argv[7]).read().splitlines():
+    f, h = line.split()
+    files[f] = h
 json.dump({
   "engine": "chromium", "version": pk["chromium"].rsplit("-", 1)[0], "platform": "linux-x86_64",
   "imageRef": {"sha256": h, "format": "tar+zstd rootfs", "source": "https://archive.archlinux.org/repos/%s/" % date,
-               "chromiumPackage": "%s" % (sys.argv[5] if len(sys.argv) > 5 else "from snapshot"),
-               "packages": pk, "run": "bwrap --unshare-all --ro-bind <rootfs> / ... /usr/bin/chromium"},
+               "chromiumPackage": sys.argv[5],
+               "buildTools": sys.argv[6],
+               "hooks": "alpm hooks from the rootfs run during install (22 on 2026-10-30, some fail harmlessly); ldconfig, fc-cache, pixbuf loaders and glib schemas are rerun by hand",
+               "packages": pk, "packageFiles": files,
+               "run": "see dp1c.py render(): bwrap --ro-bind <rootfs> / --dev /dev --proc /proc --tmpfs /tmp --ro-bind <assets> /work --bind <out> /out --ro-bind <harness dir> /harness --unshare-all --uid 0 --gid 0 --cap-add CAP_NET_ADMIN --chdir / --clearenv [env] /bin/bash -c 'mkdir -p /tmp/xdg /tmp/xdgc /tmp/run /tmp/profile && exec /usr/bin/python /harness/harness.py' with the render config on stdin; harness.py brings lo up, drops caps via setpriv, serves /work on 127.0.0.1 and drives chromium over the DevTools pipe"},
 }, open(out, "w"), indent=2)
 PY
 du -sh "$ROOT" | cut -f1 | xargs echo ">> rootfs size:"
