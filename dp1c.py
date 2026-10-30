@@ -39,6 +39,9 @@ DETERMINISTIC_FLAGS = [
     "--enable-begin-frame-control",
     "--disable-extensions",
     "--disable-background-networking",
+    "--disable-crashpad",            # no crash handler process inside the sandbox
+    "--disable-crash-reporter",
+    "--disable-dev-shm-usage",
     "--no-first-run",
     "--no-default-browser-check",
     "--no-sandbox",
@@ -62,15 +65,33 @@ def engine_pin(viewport, budget_ms):
         "viewport": {"width": viewport[0], "height": viewport[1], "deviceScaleFactor": 1},
         "virtualTimeBudgetMs": budget_ms,
         "network": "none",
+        "env": SANDBOX_ENV,
         "imageRef": None,   # the honest gap: a content-addressed runtime image goes here
     }
 
 # ---------- engine image (pinned rootfs) -----------------------------------
 
 ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
+SANDBOX_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/tmp", "TMPDIR": "/tmp", "XDG_CONFIG_HOME": "/tmp/xdg",
+               "XDG_CACHE_HOME": "/tmp/xdgc", "XDG_RUNTIME_DIR": "/tmp/run", "LANG": "C.UTF-8", "TZ": "UTC"}
+
+def _env_args():
+    out = ["--clearenv"]
+    for k, v in SANDBOX_ENV.items(): out += ["--setenv", k, v]
+    return out
+
+MOUNT_POINTS = ("dev", "proc", "tmp", "work", "out")
+
+def _mountpoints(root):
+    for m in MOUNT_POINTS: os.makedirs(os.path.join(root, m), exist_ok=True)
+    return root
 
 def engine_open(path_or_sha):
     """Return (rootfs_dir, engine_manifest). Accepts a rootfs dir, an engine-<sha>.tar.zst, or a bare sha in the cache."""
+    root, man = _engine_open(path_or_sha)
+    return _mountpoints(root), man
+
+def _engine_open(path_or_sha):
     if os.path.isdir(path_or_sha):
         root = path_or_sha
         man = json.load(open(os.path.join(root, "opt", "dp1c", "engine.json"))) if os.path.exists(os.path.join(root, "opt", "dp1c", "engine.json")) else None
@@ -93,7 +114,7 @@ def engine_open(path_or_sha):
 
 def engine_version(root):
     out = subprocess.run(["bwrap", "--ro-bind", root, "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
-                          "--unshare-all", "--setenv", "HOME", "/tmp", "/usr/bin/chromium", "--version"],
+                          "--unshare-all", *_env_args(), "/usr/bin/chromium", "--version"],
                          capture_output=True, text=True).stdout.strip()
     for tok in out.split():
         if tok[0].isdigit() and tok.count(".") == 3: return tok
@@ -104,7 +125,10 @@ def render_in_engine(root, assets_dir, entry, engine, out_png):
     loopback is brought up inside so the work is served over http from within the namespace."""
     vp = engine["viewport"]
     flags = " ".join(shlex.quote(f) for f in engine["flags"])
-    inner = (f"ip link set lo up 2>/dev/null || true; "
+    lo_up = ("import socket,fcntl,struct;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+             "i=struct.pack('16sH14s',b'lo',0,b'\\0'*14);f=struct.unpack('16sH14s',fcntl.ioctl(s,0x8913,i))[1];"
+             "fcntl.ioctl(s,0x8914,struct.pack('16sH14s',b'lo',f|1,b'\\0'*14))")
+    inner = (f"mkdir -p /tmp/xdg /tmp/xdgc /tmp/run /tmp/profile; python -c {shlex.quote(lo_up)}; "
              f"python -m http.server --bind 127.0.0.1 8731 -d /work >/dev/null 2>&1 & "
              f"for i in $(seq 50); do python -c 'import socket;socket.create_connection((\"127.0.0.1\",8731),0.1)' 2>/dev/null && break; sleep 0.1; done; "
              f"exec /usr/bin/chromium {flags} --window-size={vp['width']},{vp['height']} "
@@ -113,8 +137,9 @@ def render_in_engine(root, assets_dir, entry, engine, out_png):
     outdir = os.path.dirname(os.path.abspath(out_png)) or "."
     cmd = ["bwrap", "--ro-bind", root, "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
            "--ro-bind", os.path.abspath(assets_dir), "/work", "--bind", outdir, "/out",
-           "--unshare-all", "--cap-add", "CAP_NET_ADMIN", "--die-with-parent", "--setenv", "HOME", "/tmp",
-           "--setenv", "LANG", "C.UTF-8", "/bin/bash", "-c", inner]
+           "--unshare-all", "--uid", "0", "--gid", "0", "--cap-add", "CAP_NET_ADMIN", "--die-with-parent",
+           *_env_args(), "/bin/bash", "-c", inner]
+    if os.environ.get("DP1C_DEBUG"): print("bwrap cmd:", " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     shot = os.path.join(outdir, "shot.png")
     if not os.path.exists(shot):
@@ -219,9 +244,9 @@ def cmd_build(a):
     with tempfile.TemporaryDirectory() as stage:
         assets = os.path.join(stage, "assets"); shutil.copytree(work, assets)
         asset_hashes = {}
-        for root, _, files in os.walk(assets):
+        for dirpath, _, files in os.walk(assets):
             for n in files:
-                p = os.path.join(root, n); asset_hashes[os.path.relpath(p, assets)] = sha256_file(p)
+                p = os.path.join(dirpath, n); asset_hashes[os.path.relpath(p, assets)] = sha256_file(p)
 
         os.makedirs(os.path.join(stage, "meta", "engine")); os.makedirs(os.path.join(stage, "meta", "render"))
         png = os.path.join(stage, "meta", "render", "reference.png")
