@@ -37,7 +37,7 @@ Ids (playlist, item) are uuid5 of source + asset hashes, so they are stable acro
 
 ## Worked example: Fidenza #503
 
-`examples/fidenza-503.dp1c`. HTML read straight from the Art Blocks on-chain generator (`getTokenHtml`, block 26308641), p5 1.0.0 inlined by the contract, zero network references. 1920×1080, builds in under a second, verifies exact three times out of three on this machine. A one-color palette edit in the HTML is caught twice: the asset hash fails and the frame hash fails.
+`examples/fidenza-503.dp1c`. HTML read straight from the Art Blocks on-chain generator (`getTokenHtml`, block 26308641), p5 1.0.0 inlined by the contract, zero network references. 1920×1080, builds in under a second, verifies exact three times out of three on this machine. Changing one nibble of the token hash in the HTML is caught twice: the asset hash fails and the frame hash fails (dHash distance 8, exit 2).
 
 ## What is real and what is not
 
