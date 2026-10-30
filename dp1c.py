@@ -17,7 +17,7 @@ Commands
 Only stdlib + zstandard + Pillow + a chromium binary. No Feral File service anywhere.
 """
 import argparse, hashlib, http.server, io, json, os, platform, shutil, socket, socketserver
-import subprocess, sys, tarfile, tempfile, threading, time, uuid
+import shlex, subprocess, sys, tarfile, tempfile, threading, time, uuid
 from datetime import datetime, timezone
 
 import zstandard
@@ -65,7 +65,64 @@ def engine_pin(viewport, budget_ms):
         "imageRef": None,   # the honest gap: a content-addressed runtime image goes here
     }
 
-# ---------- offline render --------------------------------------------------
+# ---------- engine image (pinned rootfs) -----------------------------------
+
+ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
+
+def engine_open(path_or_sha):
+    """Return (rootfs_dir, engine_manifest). Accepts a rootfs dir, an engine-<sha>.tar.zst, or a bare sha in the cache."""
+    if os.path.isdir(path_or_sha):
+        root = path_or_sha
+        man = json.load(open(os.path.join(root, "opt", "dp1c", "engine.json"))) if os.path.exists(os.path.join(root, "opt", "dp1c", "engine.json")) else None
+        return root, man
+    if os.path.isfile(path_or_sha):
+        sha = sha256_file(path_or_sha)
+        root = os.path.join(ENGINE_CACHE, sha, "rootfs")
+        if not os.path.isdir(root):
+            os.makedirs(root, exist_ok=True)
+            subprocess.run(f"zstd -d -q -c {shlex.quote(path_or_sha)} | tar -x -C {shlex.quote(root)}", shell=True, check=True)
+        side = os.path.splitext(os.path.splitext(path_or_sha)[0])[0] + ".json"
+        man = json.load(open(side)) if os.path.exists(side) else None
+        if man: json.dump(man, open(os.path.join(ENGINE_CACHE, sha, "engine.json"), "w"), indent=2)
+        return root, man
+    root = os.path.join(ENGINE_CACHE, path_or_sha, "rootfs")
+    if os.path.isdir(root):
+        mp = os.path.join(ENGINE_CACHE, path_or_sha, "engine.json")
+        return root, (json.load(open(mp)) if os.path.exists(mp) else None)
+    sys.exit(f"engine {path_or_sha} not found (not a dir, not a tar.zst, not in {ENGINE_CACHE})")
+
+def engine_version(root):
+    out = subprocess.run(["bwrap", "--ro-bind", root, "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+                          "--unshare-all", "--setenv", "HOME", "/tmp", "/usr/bin/chromium", "--version"],
+                         capture_output=True, text=True).stdout.strip()
+    for tok in out.split():
+        if tok[0].isdigit() and tok.count(".") == 3: return tok
+    return out
+
+def render_in_engine(root, assets_dir, entry, engine, out_png):
+    """Render inside the pinned rootfs. Network namespace is unshared at the kernel level (bwrap --unshare-net);
+    loopback is brought up inside so the work is served over http from within the namespace."""
+    vp = engine["viewport"]
+    flags = " ".join(shlex.quote(f) for f in engine["flags"])
+    inner = (f"ip link set lo up 2>/dev/null || true; "
+             f"python -m http.server --bind 127.0.0.1 8731 -d /work >/dev/null 2>&1 & "
+             f"for i in $(seq 50); do python -c 'import socket;socket.create_connection((\"127.0.0.1\",8731),0.1)' 2>/dev/null && break; sleep 0.1; done; "
+             f"exec /usr/bin/chromium {flags} --window-size={vp['width']},{vp['height']} "
+             f"--force-device-scale-factor={vp['deviceScaleFactor']} --virtual-time-budget={engine['virtualTimeBudgetMs']} "
+             f"--user-data-dir=/tmp/profile --screenshot=/out/shot.png http://127.0.0.1:8731/{entry}")
+    outdir = os.path.dirname(os.path.abspath(out_png)) or "."
+    cmd = ["bwrap", "--ro-bind", root, "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+           "--ro-bind", os.path.abspath(assets_dir), "/work", "--bind", outdir, "/out",
+           "--unshare-all", "--cap-add", "CAP_NET_ADMIN", "--die-with-parent", "--setenv", "HOME", "/tmp",
+           "--setenv", "LANG", "C.UTF-8", "/bin/bash", "-c", inner]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    shot = os.path.join(outdir, "shot.png")
+    if not os.path.exists(shot):
+        sys.exit(f"engine render failed:\n{r.stderr[-3000:]}")
+    if os.path.abspath(shot) != os.path.abspath(out_png): shutil.move(shot, out_png)
+    return open(out_png, "rb").read()
+
+# ---------- offline render (host chromium, fallback) ------------------------
 
 class _Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -152,6 +209,12 @@ def cmd_build(a):
     if not os.path.exists(os.path.join(work, a.entry)): sys.exit(f"entry {a.entry} not in {work}")
     viewport = tuple(int(x) for x in a.viewport.split("x"))
     engine = engine_pin(viewport, a.budget)
+    root = None
+    if a.engine:
+        root, man = engine_open(a.engine)
+        engine["version"] = engine_version(root)
+        engine["imageRef"] = (man or {}).get("imageRef") or {"sha256": None, "note": "engine dir given without manifest"}
+        engine["flags"] = [f for f in engine["flags"]]  # same flag set inside the engine
 
     with tempfile.TemporaryDirectory() as stage:
         assets = os.path.join(stage, "assets"); shutil.copytree(work, assets)
@@ -162,7 +225,9 @@ def cmd_build(a):
 
         os.makedirs(os.path.join(stage, "meta", "engine")); os.makedirs(os.path.join(stage, "meta", "render"))
         png = os.path.join(stage, "meta", "render", "reference.png")
-        t0 = time.time(); png_bytes = render(assets, a.entry, engine, png); dt = time.time() - t0
+        t0 = time.time()
+        png_bytes = render_in_engine(root, assets, a.entry, engine, png) if root else render(assets, a.entry, engine, png)
+        dt = time.time() - t0
         fh = frame_hash(png_bytes)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -194,6 +259,7 @@ def cmd_build(a):
                   open(os.path.join(stage, "meta", "render", "reference.json"), "w"), indent=2)
         cid = pack(stage, a.out)
     print(json.dumps({"capsule": a.out, "capsuleId": cid, "frameHash": fh, "engine": engine["version"],
+                      "engineImage": (engine.get("imageRef") or {}).get("sha256"),
                       "renderSeconds": round(dt, 1), "assets": len(asset_hashes)}, indent=2))
 
 def cmd_verify(a):
@@ -204,8 +270,20 @@ def cmd_verify(a):
         pl = json.load(open(os.path.join(d, "playlist.json")))
         assets = os.path.join(d, "assets")
         bad = [k for k, h in ref["assets"].items() if sha256_file(os.path.join(assets, k)) != h]
-        here = chromium_version()
-        png = render(assets, ref["entry"], engine, os.path.join(d, "verify.png"))
+        want_img = (engine.get("imageRef") or {}).get("sha256")
+        root = None
+        if a.engine:
+            root, _ = engine_open(a.engine)
+        elif want_img and os.path.isdir(os.path.join(ENGINE_CACHE, want_img, "rootfs")):
+            root = os.path.join(ENGINE_CACHE, want_img, "rootfs")
+        elif want_img and not a.host:
+            sys.exit(f"capsule is pinned to engine image {want_img}; it is not in {ENGINE_CACHE} and no --engine was given. "
+                     f"Pass --engine <engine-{want_img}.tar.zst>, or --host to verify with this machine's chromium (weaker claim).")
+        if root and want_img and a.engine and os.path.isfile(a.engine) and sha256_file(a.engine) != want_img:
+            sys.exit(f"engine image mismatch: capsule wants {want_img}, given {sha256_file(a.engine)}")
+        here = engine_version(root) if root else chromium_version()
+        png = render_in_engine(root, assets, ref["entry"], engine, os.path.join(d, "verify.png")) if root \
+              else render(assets, ref["entry"], engine, os.path.join(d, "verify.png"))
         fh = frame_hash(png)
         if a.png: shutil.copy(os.path.join(d, "verify.png"), a.png)
         want = pl["items"][0]["repro"]["frameHash"]
@@ -213,6 +291,7 @@ def cmd_verify(a):
         ham = bin(int(fh["phash"], 16) ^ int(want["phash"], 16)).count("1")
         print(json.dumps({"capsuleId": sha256_file(a.capsule), "assetsIntact": not bad, "corruptAssets": bad,
                           "enginePinned": engine["version"], "engineHere": here,
+                          "engineImagePinned": want_img, "ranInsideEngine": bool(root),
                           "frameHashExpected": want["sha256"], "frameHashHere": fh["sha256"],
                           "exact": match, "phashDistance": ham,
                           "verdict": "reproduced" if match else ("near" if ham <= 4 else "reproMismatch")}, indent=2))
@@ -230,15 +309,19 @@ def cmd_render(a):
     print(json.dumps(frame_hash(b)))
 
 def main():
-    if not CHROMIUM: sys.exit("no chromium binary on PATH")
+    pass
     p = argparse.ArgumentParser(prog="dp1c"); sp = p.add_subparsers(dest="cmd", required=True)
     b = sp.add_parser("build"); b.add_argument("workdir"); b.add_argument("--entry", default="index.html")
     b.add_argument("--out", required=True); b.add_argument("--title", default="Untitled")
     b.add_argument("--source"); b.add_argument("--provenance"); b.add_argument("--seed"); b.add_argument("--created", help="fixed timestamp for reproducible packing")
     b.add_argument("--license", default="token"); b.add_argument("--duration", type=int, default=300)
     b.add_argument("--viewport", default="1920x1080"); b.add_argument("--budget", type=int, default=10000)
+    b.add_argument("--engine", help="pinned engine: rootfs dir, engine-<sha>.tar.zst, or cached sha")
     b.set_defaults(f=cmd_build)
-    v = sp.add_parser("verify"); v.add_argument("capsule"); v.add_argument("--png"); v.set_defaults(f=cmd_verify)
+    v = sp.add_parser("verify"); v.add_argument("capsule"); v.add_argument("--png")
+    v.add_argument("--engine", help="engine image to run inside (checked against the capsule's imageRef)")
+    v.add_argument("--host", action="store_true", help="allow this machine's chromium when the pinned engine is absent")
+    v.set_defaults(f=cmd_verify)
     i = sp.add_parser("info"); i.add_argument("capsule"); i.set_defaults(f=cmd_info)
     r = sp.add_parser("render"); r.add_argument("workdir"); r.add_argument("--entry", default="index.html")
     r.add_argument("--png", required=True); r.add_argument("--viewport", default="1920x1080")
