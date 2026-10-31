@@ -878,10 +878,12 @@ def write_capsule(a, stage, outdir, root, version, image_ref, engine, entry, ite
 
 def cmd_build(a):
     work = os.path.abspath(a.workdir)
-    if not os.path.isfile(os.path.join(work, a.entry)):
-        sys.exit(f"entry {a.entry} not in {work}")
-    if "/" in a.entry or a.entry.startswith("."):
-        sys.exit("entry must be a plain file name at the asset root")
+    # the entry is a file name, optionally with a query the work reads (fxhash-style seeding: index.html?fxhash=0x...)
+    entry_path, _, entry_query = a.entry.partition("?")
+    if not os.path.isfile(os.path.join(work, entry_path)):
+        sys.exit(f"entry {entry_path} not in {work}")
+    if "/" in entry_path or entry_path.startswith(".") or "#" in a.entry:
+        sys.exit("entry must be a plain file name at the asset root, with at most a query string")
     root, version, image_ref, engine = open_engine_for_build(a)
     with tempfile.TemporaryDirectory() as stage, tempfile.TemporaryDirectory() as outdir:
         shutil.copytree(work, os.path.join(stage, "assets"))
@@ -1008,7 +1010,7 @@ def cmd_verify(a):
             replay = {"entry": capture["entry"], "resources": capture["resources"]}
         elif ref.get("mode", "files") != "files":
             bad.append("unknown mode " + str(ref.get("mode")))
-        elif ref["entry"] not in ref["assets"]:
+        elif ref["entry"].partition("?")[0] not in ref["assets"]:
             bad.append("entry file is not in the asset manifest")
         if bad:
             # nothing from a capsule that fails its static checks is rendered

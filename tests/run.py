@@ -65,6 +65,33 @@ for page in ["raf", "timer", "iframe", "caf"]:
     check(f"{page}: Date.now() at capture is {EXPECT_NOW}", ref["page"]["now"] == EXPECT_NOW, str(ref["page"]["now"]))
     check(f"{page}: no render problems recorded", not any(ref["problems"].values()))
 
+# an entry with a query: the work sees it in location.href, the capsule records it, two builds agree, verify is exact
+caps = []
+for i in (1, 2):
+    cap = os.path.join(out, f"raf-query-{i}.dp1c")
+    run(
+        "build",
+        os.path.join(ROOT, "tests", "pages", "raf"),
+        "--host",
+        "--out",
+        cap,
+        "--created",
+        CREATED,
+        "--entry",
+        "index.html?fxhash=0xabc&fxiteration=1",
+    )
+    caps.append(cap)
+check("query entry: two builds give identical bytes", sha256(caps[0]) == sha256(caps[1]))
+ref, _ = reference(caps[0])
+check(
+    "query entry: recorded and seen by the page",
+    ref["entry"] == "index.html?fxhash=0xabc&fxiteration=1"
+    and ref["page"]["href"].endswith("/index.html?fxhash=0xabc&fxiteration=1"),
+    ref["page"]["href"],
+)
+r = run("verify", caps[0], "--host", ok=False)
+check("query entry: verifies exact", json.loads(r.stdout).get("exact") is True, json.loads(r.stdout).get("verdict"))
+
 r = run(
     "build",
     os.path.join(ROOT, "tests", "pages", "worker"),

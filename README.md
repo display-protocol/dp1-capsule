@@ -15,6 +15,7 @@ engine/build-engine.sh 2026/10/20 out/ [exact-chromium-pkg-url]        # once pe
 python3 dp1c.py build  WORKDIR --engine out/engine-<sha>.tar.zst --out work.dp1c [--entry index.html] [--title ..] [--source URL] [--provenance p.json] [--seed 0x..] [--created ISO] [--frames 60] [--pin-random SEED]
 python3 dp1c.py import-capture --cache-root ~/.cache/offline-artworks --source <item.source URL> --engine out/engine-<sha>.tar.zst --out work.dp1c   # from an FF1's offline store
 tools/ff1-cast.py <ff-cli device name> downloadPlaylistItem '{"item": {...}}'   # ask an FF1 to capture a work first; then pull its ~/.cache/offline-artworks over SSH
+tools/onchfs-read.py <cid> workdir/   # read an onchfs:// tree straight from the Ethereum contract (fxhash works), then build with --entry 'index.html?fxhash=0x...'
 python3 dp1c.py verify work.dp1c [--engine out/engine-<sha>.tar.zst] [--host] [--allow-engine-mismatch] [--png out.png]
 python3 dp1c.py info   work.dp1c
 python3 dp1c.py keygen key.pem && python3 dp1c.py sign work.dp1c --key key.pem --role publisher
@@ -62,6 +63,10 @@ The harness talks to Chromium over the DevTools pipe: device metrics set before 
 - Tampers caught before any render, all `assetsCorrupt`: one bit flipped in a shader blob; one resource removed from the table (its blob is then unreferenced); a resource whose digest is a filesystem path; two blobs swapped with a truthful manifest (names no longer equal digests); an entry changed to `about:blank`.
 - The device marked the capture `partial` because of the favicon 404; the importer requires `--allow-incomplete` for that, and the render treats a favicon 404 as nothing.
 - **Different machine:** the same Mac mini, same image under Rosetta: `reproduced`, same frame hash, all seven requests replayed.
+
+## Worked example 3: There's No Distance #1 (files, code read from chain, platform gone)
+
+`examples/theres-no-distance-1.dp1c`. Casey Reas, 2023, released on fxhash on Ethereum. fxhash closed on 2026-08-17 and its domains no longer resolve; the token's metadata, Raster, the Feral File indexer and FF OS all point `onchfs://` at `onchfs.fxhash2.xyz`, so the work is intact on chain and unreachable through every path that existed for it. `tools/onchfs-read.py` reads the five files (index.html, sketch.js, fxhash.js, p5.js 1.7.0, style.css; 1.0 MB, stored gzip) from the onchfs contract at a pinned block with no fxhash service involved, and `build` takes the fxhash seed the way the work expects it, in the URL: `--entry 'index.html?fxhash=0x06ec…&fxiteration=1&fxminter=0x308B…'`. The page sees that query in `location.href`, the capsule records it, and the playlist `source` is the token's own `onchfs://…/?fxhash=…` URI. WebGL, animated (the cubes turn with the frame count), no network. Measured: two builds give the same capsule id (`376febae…`); frame hash `75fb2433…`; `reproduced`, 60 ticks, 60 callbacks, no render problems; the publisher signature valid; the same verdict on the Apple Silicon Mac mini through Docker with the signer demanded.
 
 ## What changed after review
 

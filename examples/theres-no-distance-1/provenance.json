@@ -1,0 +1,10 @@
+{
+  "type": "onChain",
+  "contract": {
+    "chain": "evm",
+    "standard": "erc721",
+    "address": "0x0bb104C8A3ba07D1B9dAE6C2eAceD7f279314b9e",
+    "tokenId": "1"
+  },
+  "note": "Code read from the onchfs file system contract 0x9e0f2864c6f125bbf599df6ca6e6c3774c5b2e04 on Ethereum at block 26313749 (tools/onchfs-read.py; record in onchfs-read.json). Token metadata ipfs://QmVmqD1rksVUFW8r9w18AGnRuTbnfS73VjiaAGY6HERzM3/1/metadata.json names generatorUri onchfs://1639e8c989cddd2c0f9e951b126a21b1964309854c0a8e0a9b1193a655c6712a and iterationHash 0x06ec9e7605f8f3de9446aa2d3c8f978f53297582022aaf045420677cf60645eb; its animation_url points at onchfs.fxhash2.xyz, which no longer resolves (fxhash closed 2026-08-17)."
+}

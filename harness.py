@@ -222,7 +222,12 @@ def main():
     )  # the pin fixes the port, so the page sees the same origin every run
     replay = cfg.get("replay")
     table = replay_table(replay["resources"]) if replay else None
-    url = replay["entry"] if replay else f"http://127.0.0.1:{port}/{urllib.parse.quote(cfg['entry'])}"
+    if replay:
+        url = replay["entry"]
+    else:
+        # the entry may carry a query (a work seeded through its URL, fxhash style): the path is quoted, the query kept
+        epath, _, equery = cfg["entry"].partition("?")
+        url = f"http://127.0.0.1:{port}/{urllib.parse.quote(epath)}" + (f"?{equery}" if equery else "")
     vp = cfg["viewport"]
     frames, interval = int(cfg.get("frames") or 0), float(cfg.get("frameIntervalMs") or 16.667)
     nonce = secrets.token_hex(16)
