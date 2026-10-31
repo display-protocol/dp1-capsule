@@ -17,7 +17,7 @@ python3 dp1c.py import-capture --cache-root ~/.cache/offline-artworks --source <
 python3 dp1c.py verify work.dp1c [--engine out/engine-<sha>.tar.zst] [--host] [--allow-engine-mismatch] [--png out.png]
 python3 dp1c.py info   work.dp1c
 python3 dp1c.py keygen key.pem && python3 dp1c.py sign work.dp1c --key key.pem --role publisher
-./verify-in-docker.sh out/engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json]     # on a machine with Docker instead of bubblewrap (untested as of 2026-10-30)
+./verify-in-docker.sh out/engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json]     # on a machine with Docker instead of bubblewrap (measured on an Apple Silicon Mac, below)
 ```
 
 `build` copies the work into `assets/`, hashes every file, renders once inside the engine, refuses to write a capsule if any resource failed to load, any HTTP error other than favicon occurred, or an uncaught exception fired (`--allow-render-errors` records them instead), writes the pin, the reference frame and its hash, and packs a deterministic archive whose sha256 is the capsule id. Same inputs and the same `--created` give the same bytes.
@@ -25,6 +25,8 @@ python3 dp1c.py keygen key.pem && python3 dp1c.py sign work.dp1c --key key.pem -
 `import-capture` reads the record FF OS wrote when the device ran the work (`items/<sha256(source)>.json`: entry URL, every request with status, declared content type, replayable headers, redirect target and body hash) and the blobs it names, copies the blobs into `assets/<sha256>`, writes the table to `meta/capture/resources.json`, carries the DP-1 item verbatim (title, provenance, license), and renders with request interception on: the page navigates to its real URL and every request is answered from the table, the way the device's own offline replay does. Nothing is fetched; a request the table cannot answer fails with `net::ERR_FAILED`, is recorded, and the build refuses. Only the headers that change how the browser treats a response are replayed (the CORS and cross-origin set FF OS allowlists, plus the declared content type). `verify` replays the same way, after static checks that every body digest names exactly the asset it says, every asset is referenced, and every redirect is a 3xx to an http(s) URL (prototype limits, refused at import: GET and HEAD only, one record per method+URL, bodies under 200 MB).
 
 `sign` writes a detached Ed25519 signature over the capsule id into `<capsule>.sig.json`, in the DP-1 §7 object shape with a `did:key` identifier (`keygen` makes a key). `verify --require-signer <did:key>` refuses a capsule not validly signed by that key; forged signatures and signatures carried over to a tampered capsule both fail.
+
+The engine image built on 2026-10-30 carries no signature library, so inside it `verify` reports every signature as "library unavailable here" and `--require-signer` fails; the builder now lists `python-cryptography` for the next image.
 
 `verify` checks three things and reports them separately: every file under `assets/` matches the manifest and the playlist (no missing, no extra, no changed); the three copies of the reference frame agree (playlist, `reference.json`, the PNG's own pixels); and a fresh render inside the pinned engine, under the pinned harness, reproduces the frame hash. Verdicts: `reproduced` (exit 0), `reproducedOnDifferentEngine`, `nearOnDifferentEngine`, `reproMismatch`, `renderProblems` (something failed to load, threw, was still in flight, ran in a worker or out-of-process frame, or in replay was not served from the capture; the pixel comparison is reported but does not decide, and a capsule that recorded problems at build is reported this way every time), `assetsCorrupt` (a file or a static check failed; nothing is rendered), `unsigned`, `signatureInvalid` (all exit 2). Flags, environment and value ranges for the render come from this tool, never from the capsule.
 
@@ -48,6 +50,7 @@ The harness talks to Chromium over the DevTools pipe: device metrics set before 
 - Chromium 154 image via `--allow-engine-mismatch`: same frame hash, reported as `reproducedOnDifferentEngine`. One version step, zero pixel drift, for this work.
 - Tampers caught: one nibble of the token hash (assets and pixels both fail); a comment-only edit (pixels same, assets fail); an extra unlisted file; an edited `reference.json` frame record. Wrong engine image refused. Missing engine refused without `--host`.
 - A test page loading p5 from a CDN is refused at build with the kernel's disconnected error.
+- **Different machine:** a Mac mini (Apple Silicon, macOS 26.5), Docker in a Colima VM with Rosetta running the x86-64 image, network none, read-only root: `reproduced`, same frame hash, exit 0. Verify took about six seconds once the image was imported.
 
 ## Worked example 2: E-volved Formula #22 #1 (replay, captured by an FF1)
 
@@ -57,6 +60,7 @@ The harness talks to Chromium over the DevTools pipe: device metrics set before 
 - Before the frame schedule: two renders in the same image gave different frame hashes (the title fade had run a different number of frames). With it: `reproduced`, exit 0, and two builds give the same capsule id.
 - Tampers caught before any render, all `assetsCorrupt`: one bit flipped in a shader blob; one resource removed from the table (its blob is then unreferenced); a resource whose digest is a filesystem path; two blobs swapped with a truthful manifest (names no longer equal digests); an entry changed to `about:blank`.
 - The device marked the capture `partial` because of the favicon 404; the importer requires `--allow-incomplete` for that, and the render treats a favicon 404 as nothing.
+- **Different machine:** the same Mac mini, same image under Rosetta: `reproduced`, same frame hash, all seven requests replayed.
 
 ## What changed after review
 
@@ -70,7 +74,7 @@ Real: both layouts, the deterministic archive, the pinned engine image and its b
 
 Not yet real, in order of how much they matter:
 
-1. **Cross-machine reproduction.** The image removes the GPU, fonts, locale and clock; it has only run on this laptop. SwiftShader and Skia may still take CPU-specific paths. The claim to test next: same image, different machine, same hash.
+1. **Cross-machine reproduction beyond one pair.** Measured once: this x86-64 laptop under bubblewrap and an Apple Silicon Mac mini running the image under Rosetta in Docker give the same hash for both examples. SwiftShader and Skia may still take CPU-specific paths on other hardware; the claim to widen: more machines, including an FF1 and a real x86-64 Docker host.
 2. **Bit-exact engine rebuild.** Install scriptlets run during the build and generate caches. The manifest now carries every package file's sha256, so a rebuild can be checked against the image digest, but a matching rebuild has not yet been demonstrated. The blob on IPFS plus Arweave is the real pin; the recipe is the fallback.
 3. **The engine in 2036.** The image runs under bubblewrap today and would import as an OCI container. Running it under x86-64 emulation, with a pinned kernel and CPU model, is the long-term path and has not been exercised.
 4. **Who signs.** The example is signed by a prototype key generated on this laptop. Which key signs in production and where its `did:key` is published is open.

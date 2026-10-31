@@ -82,7 +82,7 @@ meta/render/reference.png     the reference frame
 
 **Isolation.** The image runs under a user-namespace sandbox (bubblewrap): every namespace unshared, image read-only at `/`, `assets/` read-only at `/work`, one fresh writable directory at `/out`, the harness read-only at `/harness`, environment cleared and set to `env`, cwd `/`. Loopback is brought up inside the empty network namespace by the harness (needs CAP_NET_ADMIN), then Chromium is started through `setpriv` with the bounding set empty and no-new-privs set. Nothing outside the namespace is reachable over the network; a resource not in `assets/` fails with the kernel's own `ERR_INTERNET_DISCONNECTED`, and the build refuses to write the capsule.
 
-**Software raster for verification, GPU for display.** The engine renders with SwiftShader (named explicitly, not by fallback), sRGB forced, Skia runtime optimizations off. A player showing the work may use the GPU. The reference hash is a conservation artifact, not a display requirement. CPU-dependent paths inside SwiftShader remain a cross-machine risk until measured.
+**Software raster for verification, GPU for display.** The engine renders with SwiftShader (named explicitly, not by fallback), sRGB forced, Skia runtime optimizations off. A player showing the work may use the GPU. The reference hash is a conservation artifact, not a display requirement. CPU-dependent paths inside SwiftShader remain a cross-machine risk; measured so far on one pair, an x86-64 laptop under bubblewrap and an Apple Silicon Mac running the image under Rosetta in Docker, with identical hashes for both examples.
 
 ## §5 Deterministic reproduction (replaces "Players MUST compute the first-frame SHA-256")
 

@@ -19,7 +19,10 @@ if docker image inspect "$TAG" >/dev/null 2>&1; then
 else
   echo ">> importing engine (one time)"; zstd -d -c "$IMG" | docker import --platform linux/amd64 --change "LABEL dp1c.engine=$SHA" - "$TAG" >/dev/null
 fi
-WORK="$(mktemp -d)"; cp "$CAP" "$WORK/capsule.dp1c"; [ -n "$SIG" ] && cp "$SIG" "$WORK/capsule.dp1c.sig.json"
+# the job directory must be somewhere the VM-backed Docker on a Mac actually mounts (Colima and Docker Desktop share $HOME,
+# not the private per-user temp directory mktemp picks there)
+WORK="$(mktemp -d "$HOME/dp1c-job.XXXXXX")"; trap 'rm -rf "$WORK"' EXIT
+cp "$CAP" "$WORK/capsule.dp1c"; [ -n "$SIG" ] && cp "$SIG" "$WORK/capsule.dp1c.sig.json"
 cp "$HERE/dp1c.py" "$HERE/harness.py" "$WORK/"
 echo ">> verifying inside the container, network none"
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp --tmpfs /out \

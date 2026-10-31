@@ -387,9 +387,14 @@ def check_signatures(capsule_path, sig_path=None):
     """Return (list of {kid, role, ts, valid, reason}) for the sidecar, or [] if there is none."""
     side = sig_path or sig_sidecar(capsule_path)
     if not os.path.exists(side): return []
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.exceptions import InvalidSignature
     cid = sha256_file(capsule_path); doc = json.load(open(side)); out = []
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        # the engine image carries no signature library; say so rather than crash, and never call a signature valid
+        return [{"kid": x.get("kid"), "role": x.get("role"), "ts": x.get("ts"), "valid": False, "reason": "signature library unavailable here"}
+                for x in doc.get("signatures", [])]
     for x in doc.get("signatures", []):
         r = {"kid": x.get("kid"), "role": x.get("role"), "ts": x.get("ts"), "valid": False, "reason": ""}
         try:

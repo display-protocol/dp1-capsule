@@ -10,7 +10,7 @@ DATE="${1:?archive date YYYY/MM/DD}"; OUT="${2:?output dir}"; CHROMIUM_URL="${3:
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dp1-engine.XXXXXX")"
 ROOT="$WORK/rootfs"; mkdir -p "$ROOT" "$OUT"
-PKGS=(bash coreutils glibc chromium ttf-dejavu ttf-liberation noto-fonts-cjk python python-pillow python-zstandard)
+PKGS=(bash coreutils glibc chromium ttf-dejavu ttf-liberation noto-fonts-cjk python python-pillow python-zstandard python-cryptography)
 
 cat > "$WORK/pacman.conf" <<CONF
 [options]
