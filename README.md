@@ -15,9 +15,13 @@ engine/build-engine.sh 2026/10/20 out/ [exact-chromium-pkg-url]        # once pe
 python3 dp1c.py build  WORKDIR --engine out/engine-<sha>.tar.zst --out work.dp1c --budget 15000 [--entry index.html] [--title ..] [--source URL] [--provenance p.json] [--seed 0x..] [--created ISO]
 python3 dp1c.py verify work.dp1c [--engine out/engine-<sha>.tar.zst] [--host] [--allow-engine-mismatch] [--png out.png]
 python3 dp1c.py info   work.dp1c
+python3 dp1c.py keygen key.pem && python3 dp1c.py sign work.dp1c --key key.pem --role publisher
+./verify-in-docker.sh out/engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json]     # on a machine with Docker instead of bubblewrap (untested as of 2026-10-30)
 ```
 
 `build` copies the work into `assets/`, hashes every file, renders once inside the engine, refuses to write a capsule if any resource failed to load, any HTTP error other than favicon occurred, or an uncaught exception fired (`--allow-render-errors` records them instead), writes the pin, the reference frame and its hash, and packs a deterministic archive whose sha256 is the capsule id. Same inputs and the same `--created` give the same bytes.
+
+`sign` writes a detached Ed25519 signature over the capsule id into `<capsule>.sig.json`, in the DP-1 §7 object shape with a `did:key` identifier (`keygen` makes a key). `verify --require-signer <did:key>` refuses a capsule not validly signed by that key; forged signatures and signatures carried over to a tampered capsule both fail.
 
 `verify` checks three things and reports them separately: every file under `assets/` matches the manifest and the playlist (no missing, no extra, no changed); the three copies of the reference frame agree (playlist, `reference.json`, the PNG's own pixels); and a fresh render inside the pinned engine, under the pinned harness, reproduces the frame hash. Verdicts: `reproduced` (exit 0), `reproducedOnDifferentEngine`, `nearOnDifferentEngine`, `reproMismatch`, `assetsCorrupt` (all exit 2). Flags and environment for the render come from this tool, never from the capsule.
 
@@ -55,7 +59,7 @@ Not yet real, in order of how much they matter:
 1. **Cross-machine reproduction.** The image removes the GPU, fonts, locale and clock; it has only run on this laptop. SwiftShader and Skia may still take CPU-specific paths. The claim to test next: same image, different machine, same hash.
 2. **Bit-exact engine rebuild.** Install scriptlets run during the build and generate caches. The manifest now carries every package file's sha256, so a rebuild can be checked against the image digest, but a matching rebuild has not yet been demonstrated. The blob on IPFS plus Arweave is the real pin; the recipe is the fallback.
 3. **The engine in 2036.** The image runs under bubblewrap today and would import as an OCI container. Running it under x86-64 emulation, with a pinned kernel and CPU model, is the long-term path and has not been exercised.
-4. **Signing.** The playlist is unsigned and `license: token`, so the example is not a valid v1.1.0 playlist as the spec stands. Decision 1 in the proposal.
+4. **Who signs.** The example is signed by a prototype key generated on this laptop. Which key signs in production and where its `did:key` is published is open.
 5. **Works that fetch.** Fidenza is the easy case. FF OS's offline capture already records the resource list with hashes; its cache layout maps onto `assets/`.
 6. **Frame schedule and tolerance.** `frameHash` is the frame at the budget. Animated works need a schedule; the artist may want a tolerance. Decisions 4 and 5.
 

@@ -18,7 +18,7 @@ directory (unpinned: reported as a different engine). --host runs this machine's
 sandbox; it is a weaker claim and is always reported as such.
 Only stdlib + zstandard + Pillow + bubblewrap. No Feral File service anywhere.
 """
-import argparse, hashlib, io, json, os, platform, shlex, shutil, subprocess, sys, tarfile, tempfile, uuid
+import argparse, base64, hashlib, io, json, os, platform, shlex, shutil, subprocess, sys, tarfile, tempfile, uuid
 from datetime import datetime, timezone
 
 import zstandard
@@ -163,6 +163,18 @@ def render(root, assets_dir, entry, engine, outdir):
     for f in ("shot.png", "render.json"):
         if os.path.exists(os.path.join(outdir, f)): os.remove(os.path.join(outdir, f))
     hdir = os.path.join(outdir, "_harness"); os.makedirs(hdir, exist_ok=True); shutil.copy(HARNESS, os.path.join(hdir, "harness.py"))
+    if root == "CONTAINER":
+        # we are already inside the engine image (verify --container); the container runtime isolates the network
+        cfg = {"out": outdir, "work": os.path.abspath(assets_dir), "entry": entry, "chromium": "/usr/bin/chromium",
+               "flags": engine["flags"], "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
+               "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
+               "cwd": "/tmp", "chromiumPrefix": []}
+        env = dict(SANDBOX_ENV); os.makedirs("/tmp/xdg", exist_ok=True); os.makedirs("/tmp/xdgc", exist_ok=True); os.makedirs("/tmp/run", exist_ok=True); os.makedirs("/tmp/profile", exist_ok=True)
+        r = subprocess.run([sys.executable, HARNESS], input=canon(cfg), capture_output=True, text=True, timeout=1800, env=env)
+        shot = os.path.join(outdir, "shot.png"); rj = os.path.join(outdir, "render.json")
+        if r.returncode != 0 or not os.path.isfile(shot) or not os.path.isfile(rj):
+            sys.exit(f"render failed (exit {r.returncode}):\n{r.stderr[-3000:]}")
+        return open(shot, "rb").read(), json.load(open(rj))
     if root:
         fs = ["--ro-bind", root, "/"]; W, O, H = "/work", "/out", "/harness"; chromium, python = "/usr/bin/chromium", "/usr/bin/python"
     else:
@@ -247,6 +259,80 @@ def check_assets(assets_dir, manifest):
            if k not in manifest or k not in present or sha256_file(os.path.join(assets_dir, k)) != manifest[k]]
     return bad
 
+# ---------- whole-capsule signature (DP-1 §7 object shape, over the capsule id) ----------
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+def b58encode(b):
+    n = int.from_bytes(b, "big"); out = ""
+    while n: n, r = divmod(n, 58); out = B58[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
+
+def b58decode(s):
+    n = 0
+    for ch in s: n = n * 58 + B58.index(ch)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + raw
+
+def did_key_from_pub(pub_bytes):
+    return "did:key:z" + b58encode(b"\xed\x01" + pub_bytes)       # multicodec ed25519-pub
+
+def pub_from_did_key(did):
+    if not did.startswith("did:key:z"): raise ValueError("only did:key with base58btc is supported")
+    raw = b58decode(did[len("did:key:z"):])
+    if raw[:2] != b"\xed\x01" or len(raw) != 34: raise ValueError("not an ed25519 did:key")
+    return raw[2:]
+
+def sig_sidecar(capsule_path): return capsule_path + ".sig.json"
+
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+def b64u_dec(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def cmd_keygen(a):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import serialization
+    if os.path.exists(a.key): sys.exit(f"{a.key} exists; not overwriting a key")
+    k = ed25519.Ed25519PrivateKey.generate()
+    pem = k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    fd = os.open(a.key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, pem); os.close(fd)
+    pub = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    print(json.dumps({"key": a.key, "kid": did_key_from_pub(pub)}, indent=2))
+
+def cmd_sign(a):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import serialization
+    k = serialization.load_pem_private_key(open(a.key, "rb").read(), password=None)
+    if not isinstance(k, ed25519.Ed25519PrivateKey): sys.exit("key is not ed25519")
+    pub = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    cid = sha256_file(a.capsule); payload_hash = "sha256:" + cid
+    entry = {"alg": "ed25519", "kid": did_key_from_pub(pub), "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "payload_hash": payload_hash, "role": a.role, "sig": b64u(k.sign(payload_hash.encode()))}
+    side = sig_sidecar(a.capsule)
+    doc = json.load(open(side)) if os.path.exists(side) else {"capsuleId": cid, "signatures": []}
+    if doc.get("capsuleId") != cid: sys.exit(f"{side} belongs to a different capsule ({doc.get('capsuleId')})")
+    doc["signatures"] = [x for x in doc["signatures"] if x["kid"] != entry["kid"]] + [entry]
+    open(side, "w").write(canon(doc))
+    print(json.dumps({"capsuleId": cid, "sidecar": side, "kid": entry["kid"], "role": a.role}, indent=2))
+
+def check_signatures(capsule_path, sig_path=None):
+    """Return (list of {kid, role, ts, valid, reason}) for the sidecar, or [] if there is none."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.exceptions import InvalidSignature
+    side = sig_path or sig_sidecar(capsule_path)
+    if not os.path.exists(side): return []
+    cid = sha256_file(capsule_path); doc = json.load(open(side)); out = []
+    for x in doc.get("signatures", []):
+        r = {"kid": x.get("kid"), "role": x.get("role"), "ts": x.get("ts"), "valid": False, "reason": ""}
+        try:
+            if doc.get("capsuleId") != cid or x.get("payload_hash") != "sha256:" + cid: raise ValueError("payload_hash is not this capsule's id")
+            if x.get("alg") != "ed25519": raise ValueError("unsupported alg")
+            ed25519.Ed25519PublicKey.from_public_bytes(pub_from_did_key(x["kid"])).verify(b64u_dec(x["sig"]), x["payload_hash"].encode())
+            r["valid"] = True
+        except (InvalidSignature, ValueError, KeyError) as e:
+            r["reason"] = str(e) or type(e).__name__
+        out.append(r)
+    return out
+
 # ---------- commands --------------------------------------------------------
 
 def cmd_build(a):
@@ -316,7 +402,11 @@ def cmd_verify(a):
         # 2. engine: computed digest is the only thing trusted
         pinned_img = (engine.get("imageRef") or {}).get("sha256")
         root, here_img = None, None
-        if a.engine:
+        if a.container:
+            here_img = os.environ.get("DP1C_CONTAINER_ENGINE_SHA")
+            if not here_img: sys.exit("--container needs DP1C_CONTAINER_ENGINE_SHA (the launcher's digest of the imported image)")
+            root = "CONTAINER"
+        elif a.engine:
             root, here_img, _ = engine_open(a.engine)
         elif pinned_img and _cache_root(pinned_img):
             root, here_img = _cache_root(pinned_img), pinned_img
@@ -330,22 +420,30 @@ def cmd_verify(a):
         harness_match = engine.get("harnessSha256") == sha256_file(HARNESS)
         # 3. render with the pin's settings; flags come from this tool, never from the capsule
         run_engine = {**engine, "flags": list(DETERMINISTIC_FLAGS), "env": dict(SANDBOX_ENV)}
-        here_ver = engine_version(root) if root else host_version()
+        here_ver = _ver(subprocess.run(["/usr/bin/chromium", "--version"], capture_output=True, text=True).stdout) if root == "CONTAINER" \
+                   else (engine_version(root) if root else host_version())
         png, rj = render(root, os.path.join(d, "assets"), ref["entry"], run_engine, outdir)
         if a.png: shutil.copy(os.path.join(outdir, "shot.png"), a.png)
         fh = frame_hash(png, engine["viewport"])
         exact = fh["sha256"] == want["sha256"]
         ham = bin(int(fh["phash"], 16) ^ int(want["phash"], 16)).count("1")
+        sigs = check_signatures(a.capsule, a.sig)
+        signer_ok = True
+        if a.require_signer:
+            signer_ok = any(x["valid"] and x["kid"] == a.require_signer for x in sigs)
         if bad: verdict = "assetsCorrupt"
+        elif not signer_ok: verdict = "unsigned" if not sigs else "signatureInvalid"
         elif exact: verdict = "reproduced" if (engine_match and harness_match) else "reproducedOnDifferentEngine"
         elif ham <= 4 and not engine_match: verdict = "nearOnDifferentEngine"
         else: verdict = "reproMismatch"
         print(json.dumps({"capsuleId": sha256_file(a.capsule), "assetsIntact": not bad, "assetProblems": bad,
                           "engineImagePinned": pinned_img, "engineImageHere": here_img, "engineMatch": engine_match,
                           "enginePinned": engine["version"], "engineHere": here_ver, "ranInsideEngine": root is not None,
+                          "sandbox": "container" if root == "CONTAINER" else ("bwrap" if root else "bwrap-host"),
                           "harnessMatch": harness_match,
                           "frameHashExpected": want["sha256"], "frameHashHere": fh["sha256"], "exact": exact,
-                          "phashDistance": ham, "renderProblems": render_problems(rj), "verdict": verdict}, indent=2))
+                          "phashDistance": ham, "renderProblems": render_problems(rj),
+                          "signatures": sigs, "requiredSigner": a.require_signer, "verdict": verdict}, indent=2))
         sys.exit(0 if verdict == "reproduced" else 2)
 
 def cmd_info(a):
@@ -366,7 +464,13 @@ def main():
     b.add_argument("--allow-render-errors", action="store_true"); b.set_defaults(f=cmd_build)
     v = sp.add_parser("verify"); v.add_argument("capsule"); v.add_argument("--png"); v.add_argument("--engine")
     v.add_argument("--host", action="store_true"); v.add_argument("--allow-engine-mismatch", action="store_true")
+    v.add_argument("--sig", help="signature sidecar (default: <capsule>.sig.json)")
+    v.add_argument("--container", action="store_true", help="already inside the engine image (see verify-in-docker.sh)")
+    v.add_argument("--require-signer", metavar="DID", help="fail unless a valid signature by this did:key is present")
     v.set_defaults(f=cmd_verify)
+    k = sp.add_parser("keygen"); k.add_argument("key"); k.set_defaults(f=cmd_keygen)
+    g = sp.add_parser("sign"); g.add_argument("capsule"); g.add_argument("--key", required=True)
+    g.add_argument("--role", default="publisher"); g.set_defaults(f=cmd_sign)
     i = sp.add_parser("info"); i.add_argument("capsule"); i.set_defaults(f=cmd_info)
     a = p.parse_args(); a.f(a)
 
