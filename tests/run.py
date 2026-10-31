@@ -6,32 +6,47 @@
 Each page is built twice with a fixed --created; the two capsules must be byte-identical and the page must have
 seen exactly 60 frames and Date.now() == epoch + budget + 60 * 16.667 ms. The worker page must be refused at build,
 naming the worker. A capsule with one byte of its entry file changed must verify as assetsCorrupt before rendering."""
+
 import io, json, os, subprocess, sys, tarfile, tempfile
 import zstandard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DP1C = [sys.executable, os.path.join(ROOT, "dp1c.py")]
 CREATED = "2026-10-30T00:00:00Z"
-CALLBACKS = {"raf": 60, "timer": 0, "iframe": 120, "caf": 1}   # per page: one per frame; none; two documents; A ran, B cancelled
+CALLBACKS = {
+    "raf": 60,
+    "timer": 0,
+    "iframe": 120,
+    "caf": 1,
+}  # per page: one per frame; none; two documents; A ran, B cancelled
 EXPECT_NOW = 1600000011000  # epoch 1600000000000 + budget 10000 + round(60 * 16.667)
+
 
 def run(*args, ok=True):
     r = subprocess.run(DP1C + list(args), capture_output=True, text=True)
-    if ok and r.returncode != 0: sys.exit(f"FAIL {' '.join(args)}\n{r.stdout}\n{r.stderr[-3000:]}")
+    if ok and r.returncode != 0:
+        sys.exit(f"FAIL {' '.join(args)}\n{r.stdout}\n{r.stderr[-3000:]}")
     return r
+
 
 def sha256(p):
     import hashlib
+
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
+
 def reference(capsule):
-    with open(capsule, "rb") as f: data = zstandard.ZstdDecompressor().stream_reader(f).read()
+    with open(capsule, "rb") as f:
+        data = zstandard.ZstdDecompressor().stream_reader(f).read()
     t = tarfile.open(fileobj=io.BytesIO(data))
     return json.load(t.extractfile("meta/render/reference.json")), data
 
+
 def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + (f"  ({detail})" if detail else ""))
-    if not cond: sys.exit(1)
+    if not cond:
+        sys.exit(1)
+
 
 out = tempfile.mkdtemp(prefix="dp1c-tests-")
 for page in ["raf", "timer", "iframe", "caf"]:
@@ -44,21 +59,35 @@ for page in ["raf", "timer", "iframe", "caf"]:
     ref, _ = reference(caps[0])
     fc = ref["frameClock"]
     check(f"{page}: 60 ticks delivered", fc["ticked"] == 60, str(fc["ticked"]))
-    check(f"{page}: {CALLBACKS[page]} animation callbacks ran", fc["callbacks"] == CALLBACKS[page], str(fc["callbacks"]))
+    check(
+        f"{page}: {CALLBACKS[page]} animation callbacks ran", fc["callbacks"] == CALLBACKS[page], str(fc["callbacks"])
+    )
     check(f"{page}: Date.now() at capture is {EXPECT_NOW}", ref["page"]["now"] == EXPECT_NOW, str(ref["page"]["now"]))
     check(f"{page}: no render problems recorded", not any(ref["problems"].values()))
 
-r = run("build", os.path.join(ROOT, "tests", "pages", "worker"), "--host", "--out", os.path.join(out, "worker.dp1c"), "--created", CREATED, ok=False)
+r = run(
+    "build",
+    os.path.join(ROOT, "tests", "pages", "worker"),
+    "--host",
+    "--out",
+    os.path.join(out, "worker.dp1c"),
+    "--created",
+    CREATED,
+    ok=False,
+)
 check("worker: build refused", r.returncode != 0, f"exit {r.returncode}")
 check("worker: refusal names the worker", "worker" in (r.stdout + r.stderr).lower())
 
 # tamper: one byte of the entry file, same length, repacked; verify must stop at the static checks
 clean = os.path.join(out, "raf-1.dp1c")
 ref, data = reference(clean)
-t = tarfile.open(fileobj=io.BytesIO(data)); buf = io.BytesIO(); w = tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT)
+t = tarfile.open(fileobj=io.BytesIO(data))
+buf = io.BytesIO()
+w = tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT)
 for m in t.getmembers():
     body = t.extractfile(m).read() if m.isreg() else None
-    if m.name == "assets/index.html": body = body.replace(b"raf ", b"RAF ", 1)
+    if m.name == "assets/index.html":
+        body = body.replace(b"raf ", b"RAF ", 1)
     w.addfile(m, io.BytesIO(body) if body is not None else None)
 w.close()
 tampered = os.path.join(out, "raf-tampered.dp1c")
@@ -70,5 +99,42 @@ check("tamper: exit 2", r.returncode == 2)
 
 r = run("verify", clean, "--host", ok=False)
 v = json.loads(r.stdout)
-check("clean: host verify reproduces the host build", v.get("exact") is True and v.get("verdict") in ("reproduced", "reproducedOnDifferentEngine"), f"verdict {v.get('verdict')}, exit {r.returncode}")
+check(
+    "clean: host verify of a host build is reproducedUnpinned, exit 2",
+    v.get("exact") is True and v.get("verdict") == "reproducedUnpinned" and r.returncode == 2,
+    f"verdict {v.get('verdict')}, exit {r.returncode}",
+)
+
+# signatures: the example sidecars verify with the library and without it (the engine image has none)
+SIGCHECK = """
+import sys, json
+if sys.argv[1] == "nolib": sys.modules["cryptography"] = None
+sys.path.insert(0, sys.argv[2]); import dp1c
+print(json.dumps(dp1c.check_signatures(sys.argv[3], sys.argv[4])))
+"""
+import shutil
+
+side = os.path.join(ROOT, "examples", "fidenza-503.dp1c.sig.json")
+cap = os.path.join(ROOT, "examples", "fidenza-503.dp1c")
+for mode in ("lib", "nolib"):
+    r = subprocess.run([sys.executable, "-c", SIGCHECK, mode, ROOT, cap, side], capture_output=True, text=True)
+    sigs = json.loads(r.stdout or "[]")
+    want = "cryptography" if mode == "lib" else "pure-python"
+    check(
+        f"signature: example sidecar valid ({mode})",
+        bool(sigs) and all(s["valid"] and s["checkedWith"] == want for s in sigs),
+        r.stdout.strip()[:120] or r.stderr[-300:],
+    )
+bad = json.load(open(side))
+sig = bad["signatures"][0]["sig"]
+bad["signatures"][0]["sig"] = ("A" if sig[0] != "A" else "B") + sig[1:]
+badside = os.path.join(out, "bad.sig.json")
+json.dump(bad, open(badside, "w"))
+r = subprocess.run([sys.executable, "-c", SIGCHECK, "nolib", ROOT, cap, badside], capture_output=True, text=True)
+sigs = json.loads(r.stdout or "[]")
+check(
+    "signature: one flipped character is invalid (pure-python)",
+    bool(sigs) and not any(s["valid"] for s in sigs),
+    r.stdout.strip()[:120],
+)
 print("all checks passed;", out)

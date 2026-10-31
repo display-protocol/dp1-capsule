@@ -18,7 +18,7 @@ tools/ff1-cast.py <ff-cli device name> downloadPlaylistItem '{"item": {...}}'   
 python3 dp1c.py verify work.dp1c [--engine out/engine-<sha>.tar.zst] [--host] [--allow-engine-mismatch] [--png out.png]
 python3 dp1c.py info   work.dp1c
 python3 dp1c.py keygen key.pem && python3 dp1c.py sign work.dp1c --key key.pem --role publisher
-./verify-in-docker.sh out/engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json]     # on a machine with Docker instead of bubblewrap (measured on an Apple Silicon Mac, below)
+./verify-in-docker.sh out/engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json] [--require-signer did:key:...]   # Docker instead of bubblewrap (measured on an Apple Silicon Mac, below)
 ```
 
 `build` copies the work into `assets/`, hashes every file, renders once inside the engine, refuses to write a capsule if any resource failed to load, any HTTP error other than favicon occurred, or an uncaught exception fired (`--allow-render-errors` records them instead), writes the pin, the reference frame and its hash, and packs a deterministic archive whose sha256 is the capsule id. Same inputs and the same `--created` give the same bytes.
@@ -27,7 +27,7 @@ python3 dp1c.py keygen key.pem && python3 dp1c.py sign work.dp1c --key key.pem -
 
 `sign` writes a detached Ed25519 signature over the capsule id into `<capsule>.sig.json`, in the DP-1 §7 object shape with a `did:key` identifier (`keygen` makes a key). `verify --require-signer <did:key>` refuses a capsule not validly signed by that key; forged signatures and signatures carried over to a tampered capsule both fail.
 
-The engine image built on 2026-10-30 carries no signature library, so inside it `verify` reports every signature as "library unavailable here" and `--require-signer` fails; the builder now lists `python-cryptography` for the next image.
+Signatures are checked with the `cryptography` library when it is present and with an RFC 8032 implementation in plain Python when it is not (the engine image built on 2026-10-30 has no library; the builder lists `python-cryptography` for the next one). The result says which (`checkedWith`), and the tests check the example sidecar both ways, plus a flipped character.
 
 `verify` checks three things and reports them separately: every file under `assets/` matches the manifest and the playlist (no missing, no extra, no changed); the three copies of the reference frame agree (playlist, `reference.json`, the PNG's own pixels); and a fresh render inside the pinned engine, under the pinned harness, reproduces the frame hash. Verdicts: `reproduced` (exit 0), `reproducedOnDifferentEngine`, `nearOnDifferentEngine`, `reproMismatch`, `renderProblems` (something failed to load, threw, was still in flight, ran in a worker or out-of-process frame, or in replay was not served from the capture; the pixel comparison is reported but does not decide, and a capsule that recorded problems at build is reported this way every time), `assetsCorrupt` (a file or a static check failed; nothing is rendered), `unsigned`, `signatureInvalid` (all exit 2). Flags, environment and value ranges for the render come from this tool, never from the capsule.
 
@@ -71,7 +71,7 @@ Second pass (Codex and Grok, same day, on the replay layout and the frame schedu
 
 ## Tests
 
-`python3 tests/run.py` (host mode, about ten seconds) re-measures the frame-clock claims on the five pages in `tests/pages/`: two builds of each page give identical bytes; 60 ticks are delivered and the expected callbacks run (one per frame; none on a timer-only page; 120 across a parent and its same-process iframe; one where the first callback cancels the second); `Date.now()` at capture is the epoch plus the settle budget plus 60 intervals; the worker page is refused naming the worker; a capsule with one byte of its entry changed is `assetsCorrupt` before any render; a clean capsule verifies exact. Its first run found the two defects the paragraph above now guards against (the jittering callback timestamp and the random, recorded loopback port). The reference record carries what the clock did (`frameClock`: ticks, callbacks, documents), so a verifier can see it without a screenshot.
+`python3 tests/run.py` (host mode, about ten seconds) re-measures the frame-clock claims on the five pages in `tests/pages/`: two builds of each page give identical bytes; 60 ticks are delivered and the expected callbacks run (one per frame; none on a timer-only page; 120 across a parent and its same-process iframe; one where the first callback cancels the second); `Date.now()` at capture is the epoch plus the settle budget plus 60 intervals; the worker page is refused naming the worker; a capsule with one byte of its entry changed is `assetsCorrupt` before any render; a host-built capsule verifies exact as `reproducedUnpinned`, exit 2; the example signature is valid with and without the library and invalid with one character flipped. Its first run found the two defects the paragraph above now guards against (the jittering callback timestamp and the random, recorded loopback port). The reference record carries what the clock did (`frameClock`: ticks, callbacks, documents), so a verifier can see it without a screenshot.
 
 ## What is real and what is not
 

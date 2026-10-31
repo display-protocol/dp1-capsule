@@ -4,9 +4,9 @@
 # Works on a Mac with Docker Desktop (Apple Silicon runs the x86-64 image under emulation: the 2036 path).
 # Mac prerequisites: Docker Desktop running; `brew install zstd`; the system python3.
 #
-#   ./verify-in-docker.sh engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json]
+#   ./verify-in-docker.sh engine-<sha>.tar.zst work.dp1c [work.dp1c.sig.json] [more verify args, e.g. --require-signer did:key:...]
 set -euo pipefail
-IMG="${1:?engine tar.zst}"; CAP="${2:?capsule}"; SIG="${3:-}"
+IMG="${1:?engine tar.zst}"; CAP="${2:?capsule}"; SIG="${3:-}"; EXTRA=("${@:4}")
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SHA="$(shasum -a 256 "$IMG" 2>/dev/null | cut -d' ' -f1 || sha256sum "$IMG" | cut -d' ' -f1)"
 PINNED="$(zstd -d -c "$CAP" | tar -xO meta/engine/chromium.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["imageRef"]["sha256"])')"
@@ -27,4 +27,4 @@ cp "$HERE/dp1c.py" "$HERE/harness.py" "$WORK/"
 echo ">> verifying inside the container, network none"
 docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp --tmpfs /out \
   -v "$WORK":/job:ro -e DP1C_CONTAINER_ENGINE_SHA="$SHA" -w /job \
-  "$TAG" /usr/bin/python /job/dp1c.py verify /job/capsule.dp1c --container
+  "$TAG" /usr/bin/python /job/dp1c.py verify /job/capsule.dp1c --container ${EXTRA[@]+"${EXTRA[@]}"}
