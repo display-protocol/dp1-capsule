@@ -18,7 +18,8 @@ CALLBACKS = {
     "timer": 0,
     "iframe": 120,
     "caf": 1,
-}  # per page: one per frame; none; two documents; A ran, B cancelled
+    "perf": 60,
+}  # per page: one per frame; none; two documents; A ran, B cancelled; one that reads performance.now() itself
 EXPECT_NOW = 1600000011000  # epoch 1600000000000 + budget 10000 + round(60 * 16.667)
 
 
@@ -49,7 +50,7 @@ def check(name, cond, detail=""):
 
 
 out = tempfile.mkdtemp(prefix="dp1c-tests-")
-for page in ["raf", "timer", "iframe", "caf"]:
+for page in ["raf", "timer", "iframe", "caf", "perf"]:
     caps = []
     for i in (1, 2):
         cap = os.path.join(out, f"{page}-{i}.dp1c")
@@ -130,6 +131,36 @@ check(
     "clean: host verify of a host build is reproducedUnpinned, exit 2",
     v.get("exact") is True and v.get("verdict") == "reproducedUnpinned" and r.returncode == 2,
     f"verdict {v.get('verdict')}, exit {r.returncode}",
+)
+
+# web3:// URL parsing (ERC-4804 auto mode), offline
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location("web3_read", os.path.join(ROOT, "tools", "web3-read.py"))
+web3_read = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(web3_read)
+u = web3_read.parse_web3_url("web3://0x4F32740CF412D647A622BA27C36FA4B76F71601F:1/artpiece")
+check(
+    "web3: contract, chain and method parse",
+    u["contract"] == "0x4f32740cf412d647a622ba27c36fa4b76f71601f"
+    and u["chain_id"] == 1
+    and u["method"] == "artpiece"
+    and u["args"] == []
+    and u["returns"] is None,
+)
+u = web3_read.parse_web3_url(
+    "web3://0x953d288708bb771f969fcfd9ba0819ef506ac718/getTokenHtml/0xa7d8d9ef8D8Ce8992Df33D8b8CF4Aebabd5bD270/78000503?returns=(string)"
+)
+check(
+    "web3: auto-mode argument types (address, uint256) and returns",
+    [t for t, _ in u["args"]] == ["address", "uint256"] and u["returns"] == ["string"],
+)
+sel = web3_read.keccak256(b"artpiece()")[:4].hex()
+check("web3: selector matches the recorded calldata for Han's contracts", sel == "37a908fc", sel)
+enc = web3_read.abi_encode([("address", "0xa7d8d9ef8D8Ce8992Df33D8b8CF4Aebabd5bD270"), ("uint256", "78000503")])
+check(
+    "web3: ABI encoding of (address, uint256)",
+    enc.hex() == "000000000000000000000000a7d8d9ef8d8ce8992df33d8b8cf4aebabd5bd270" + hex(78000503)[2:].rjust(64, "0"),
 )
 
 # signatures: the example sidecars verify with the library and without it (the engine image has none)

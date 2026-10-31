@@ -1,0 +1,15 @@
+{
+  "web3": "web3://0xf7aee95ca219d446ef35a28e6b2bae9c4e51ff07:1/artpiece",
+  "chain": "eip155:1",
+  "contract": "0xf7aee95ca219d446ef35a28e6b2bae9c4e51ff07",
+  "resolveMode": "auto",
+  "calldata": "0x37a908fc",
+  "block": 26314355,
+  "returnedBytes": 10144,
+  "returnedSha256": "d82ee88c2147d18ff2adde38651ff96e27c4784e7ac014e1aa66a1075a784a6f",
+  "file": "index.html",
+  "mime": "text/html",
+  "bytes": 10064,
+  "sha256": "118375dda46860978dffe9150dd1bc3054db3b624567672bad118ebadbc383df",
+  "verified": "none: a call has no content address; trust is the node's consensus, pinned to this block"
+}

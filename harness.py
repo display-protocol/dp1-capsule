@@ -192,6 +192,13 @@ FRAME_CLOCK = """
 (() => {
   const NONCE = %s;
   let q = [], id = 0, frozen = false; const cancelled = new Set();
+  // performance.now() is the engine's clock too. Under virtual time the real one carries sub-millisecond jitter
+  // (10983.3 vs 10983.4 on two runs), and works that drive a shader from it render differently each run. Before
+  // the frame schedule it is whole virtual milliseconds since the document started; during the schedule it is the
+  // frame's timestamp, frozen within a frame and advancing one interval per tick, the same value the
+  // requestAnimationFrame callbacks receive. Writable so a work that installs its own clock is left alone.
+  const origin = Date.now(); let frameT = null;
+  Object.defineProperty(Performance.prototype, 'now', {value: function () { return frameT !== null ? frameT : Date.now() - origin; }, writable: true, configurable: false});
   const lock = (k, v, writable) => Object.defineProperty(window, k, {value: v, writable, configurable: false});
   // The work may replace these (a polyfill that assigns is common); doing so opts the work out of the frame clock
   // and onto timers, which virtual time covers. The control surface below cannot be reached without the nonce.
@@ -199,6 +206,7 @@ FRAME_CLOCK = """
   lock('cancelAnimationFrame', (h) => { cancelled.add(h); q = q.filter(([x]) => x !== h); }, true);
   lock('__dp1c_tick', (nonce, last, t) => {
     if (nonce !== NONCE) throw new Error('dp1c: the frame clock is the engine\\'s');
+    frameT = t;
     const cur = q; q = []; const errors = []; let fired = 0;
     for (const [h, cb] of cur) { if (cancelled.has(h)) continue; fired++; try { cb(t); } catch (e) { errors.push(String(e && e.stack || e)); } }
     cancelled.clear(); if (last) frozen = true;

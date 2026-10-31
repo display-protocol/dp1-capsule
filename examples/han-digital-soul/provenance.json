@@ -1,0 +1,9 @@
+{
+  "type": "onChain",
+  "contract": {
+    "chain": "evm",
+    "standard": "other",
+    "address": "0x4f32740cf412d647A622ba27C36fa4B76F71601f"
+  },
+  "note": "Digital Soul (Han, October 2023). The work is the return of artpiece() on the artist's own contract (no token standard, no token URI), read by its web3:// URL (ERC-4804) at block 26314355 with calldata 0x37a908fc; record in web3-read.json. A call has no content address, so the read is pinned to the block and the trust is the node's."
+}

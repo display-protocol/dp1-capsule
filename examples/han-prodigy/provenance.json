@@ -1,0 +1,9 @@
+{
+  "type": "onChain",
+  "contract": {
+    "chain": "evm",
+    "standard": "other",
+    "address": "0xf7AEe95ca219D446EF35a28e6b2bae9c4E51fF07"
+  },
+  "note": "Prodigy (Han, March 2024). The work is the return of artpiece() on the artist's own contract (no token standard, no token URI), read by its web3:// URL (ERC-4804) at block 26314355 with calldata 0x37a908fc; record in web3-read.json. A call has no content address, so the read is pinned to the block and the trust is the node's."
+}
