@@ -276,7 +276,6 @@ def main():
         "verified": "every inode checksum recomputed from the bytes read (directory entries; file chunk list, metadata and content)",
         "files": manifest,
     }
-    }
     with open(os.path.join(a.outdir, "onchfs-read.json"), "w") as f:
         json.dump(rec, f, indent=2)
     print(f"block {chain.block}, {len(manifest)} files, record in {a.outdir}/onchfs-read.json")

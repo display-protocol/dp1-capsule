@@ -3,10 +3,14 @@
   "chain": "eip155:1",
   "contract": "0x9e0f2864c6f125bbf599df6ca6e6c3774c5b2e04",
   "block": 26313749,
+  "verified": "every inode checksum recomputed from the bytes read (directory entries; file chunk list, metadata and content)",
   "files": [
     {
       "path": "fxhash.js",
       "inode": "d02703beb93f4a93a6b3c3bf5e0264eab9b012902a5f1c78e75ce4f64e76d3c9",
+      "verified": "chunks",
+      "chunks": 1,
+      "metadataHpackHex": "5f901d75d0620d263d4c741f71a0961ab4ff5a839bd9ab",
       "storedBytes": 3309,
       "storedSha256": "cf38715d5858e9d4191aa1f98341c8ea41e09a73363ebf756a661ff94469372a",
       "gzip": true,
@@ -16,6 +20,9 @@
     {
       "path": "index.html",
       "inode": "2b47d12a477afb3b42c3934f8b9b04252d6d8e9e543cbbf1c3d2a5f1209d1cc3",
+      "verified": "chunks",
+      "chunks": 1,
+      "metadataHpackHex": "5f87497ca589d34d1f5a839bd9ab",
       "storedBytes": 214,
       "storedSha256": "d93b96aa375bfb1b11ada68e746db050e109349fad73bed3c53dae2a6a08d859",
       "gzip": true,
@@ -25,6 +32,9 @@
     {
       "path": "p5.min.js",
       "inode": "d91a015332a2fa50f631570532c7c1a967d8ad5b1af46052f22d4220e5f98b20",
+      "verified": "chunks",
+      "chunks": 10,
+      "metadataHpackHex": "5f901d75d0620d263d4c741f71a0961ab4ff5a839bd9ab",
       "storedBytes": 230349,
       "storedSha256": "c4d4969c034b519fc30ab72adca7bf038639455f13687a0ebc8dfece74c6ec80",
       "gzip": true,
@@ -34,6 +44,9 @@
     {
       "path": "sketch.js",
       "inode": "907d7bfd9d4abfbb43bf459a4b38c9aca14f9233de5efc50846a29eb71fc5b75",
+      "verified": "chunks",
+      "chunks": 1,
+      "metadataHpackHex": "5f901d75d0620d263d4c741f71a0961ab4ff5a839bd9ab",
       "storedBytes": 3724,
       "storedSha256": "fbc8ef7d9169902a1188bb1645132c51026f31d6f9701f2c95d7989e3fdfc8a3",
       "gzip": true,
@@ -43,6 +56,9 @@
     {
       "path": "style.css",
       "inode": "f706304b2b61f240a50060dd46e7b41f951dfc021d5cada9e3a8c530a3cd3a98",
+      "verified": "chunks",
+      "chunks": 1,
+      "metadataHpackHex": "5f86497ca582211f",
       "storedBytes": 112,
       "storedSha256": "97ba6b173372fcf476400a2df3c6553c71677f09e3622c81d6a553f758d9fdee",
       "gzip": false,
