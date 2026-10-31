@@ -7,7 +7,10 @@ onchfs (fxhash's on-chain file system) stores a directory as (names, inode check
 checksums plus HPACK-encoded headers. The two view functions used here, readDirectory(bytes32) and
 readFile(bytes32), return the names and checksums of a directory and the concatenated bytes of a file.
 Every read is made at one pinned block, recorded in <outdir>/onchfs-read.json with the sha256 of each
-file as stored and as written. Files that arrive gzip-compressed (the content-encoding onchfs writers use;
+file as stored and as written. Every inode is verified against its address: an onchfs checksum is
+keccak over the inode's content (chunk checksums and HPACK metadata for a file; sorted names and child
+checksums for a directory), so the bytes an untrusted RPC returns are proven to be the ones the address
+names, and a mismatch is a hard failure. Files that arrive gzip-compressed (the content-encoding onchfs writers use;
 sniffed by the gzip magic, the HPACK headers are not decoded here) are written decompressed, so a browser
 can serve them from a plain directory. Keyless public RPCs; no fxhash service is involved, which matters
 because fxhash closed on 2026-08-17 and its gateway no longer resolves.
@@ -129,6 +132,14 @@ class Chain:
                 err = str(e)
         sys.exit(f"every RPC failed: {err}")
 
+    def concatenate_chunks(self, pointers):
+        """concatenateChunks(bytes32[]) -> bytes: the content store's bytes for these chunk pointers, in order."""
+        arg = (32).to_bytes(32, "big").hex() + len(pointers).to_bytes(32, "big").hex() + "".join(pointers)
+        r = self.call(sel("concatenateChunks(bytes32[])") + arg)
+        if r is None:
+            sys.exit("chunk not found in the content store")
+        return dyn_bytes(r, word(r, 0))
+
     def call(self, data):
         r = self.rpc("eth_call", [{"to": self.contract, "data": "0x" + data}, hex(self.block)])
         return None if r is None else bytes.fromhex(r[2:])
@@ -147,6 +158,51 @@ def dyn_bytes(b, off):
     return b[off + 32 : off + 32 + ln]
 
 
+def decode_inode(b):
+    """inodes(bytes32) -> (uint8 inodeType, File{bytes metadata, bytes32[] chunkChecksums}, Directory{string[] filenames, bytes32[] fileChecksums})"""
+    kind = word(b, 0)
+    fo, do = word(b, 1), word(b, 2)
+    # File tuple: offsets relative to the tuple start
+    mo, co = word(b, fo // 32), word(b, fo // 32 + 1)
+    metadata = dyn_bytes(b, fo + mo)
+    n = word(b, (fo + co) // 32)
+    chunks = [b[fo + co + 32 + 32 * i : fo + co + 64 + 32 * i].hex() for i in range(n)]
+    return kind, metadata, chunks
+
+
+def verify_file(chain, cid, stored, metadata, chunks):
+    """The address commits to the content either way onchfs writers compute it: over the chunk checksums (cheap)
+    or over the whole content (consistent). Returns the strategy that matched, or exits."""
+    FILE = b"\x01"
+    mh = keccak256(metadata)
+    if keccak256(FILE + keccak256(b"".join(bytes.fromhex(c) for c in chunks)) + mh).hex() == cid:
+        strategy = "chunks"
+    elif keccak256(FILE + keccak256(stored) + mh).hex() == cid:
+        strategy = "content"
+    else:
+        sys.exit(f"inode {cid}: checksum does not match its metadata and chunk list")
+    # and the content must be the chunks: equal-sized except the last. Writers pick their own size (fxhash used
+    # 24000), so the first chunk is fetched alone once to learn it, then every chunk hash is checked locally.
+    if len(chunks) == 1:
+        ok = keccak256(stored).hex() == chunks[0]
+    else:
+        cs = len(chain.concatenate_chunks(chunks[:1]))
+        parts = [stored[i : i + cs] for i in range(0, len(stored), cs)]
+        ok = len(parts) == len(chunks) and all(keccak256(x).hex() == c for x, c in zip(parts, chunks))
+    if not ok:
+        sys.exit(f"inode {cid}: content does not match its chunk checksums")
+    return strategy
+
+
+def verify_directory(cid, entries):
+    """keccak(0x00 || for each name in descending sort order: checksum || keccak(name))"""
+    acc = b"\x00"
+    for name, sub in sorted(entries, key=lambda e: e[0], reverse=True):
+        acc += bytes.fromhex(sub) + keccak256(name.encode())
+    if keccak256(acc).hex() != cid:
+        sys.exit(f"directory {cid}: checksum does not match its entries")
+
+
 def decode_directory(b):
     o1, o2 = word(b, 0), word(b, 1)
     n = word(b, o1 // 32)
@@ -161,8 +217,10 @@ def decode_directory(b):
 def walk(chain, cid, out, rel, manifest):
     r = chain.call(sel("readDirectory(bytes32)") + cid)
     if r is not None:
+        entries = decode_directory(r)
+        verify_directory(cid, entries)
         os.makedirs(out, exist_ok=True)
-        for name, sub in decode_directory(r):
+        for name, sub in entries:
             if "/" in name or name in (".", "..") or name.startswith("."):
                 sys.exit(f"refusing directory entry {name!r}")
             walk(chain, sub, os.path.join(out, name), f"{rel}/{name}", manifest)
@@ -171,6 +229,10 @@ def walk(chain, cid, out, rel, manifest):
     if r is None:
         sys.exit(f"{rel}: inode {cid} is neither a directory nor a file at block {chain.block}")
     stored = dyn_bytes(r, word(r, 0))
+    kind, metadata, chunks = decode_inode(chain.call(sel("inodes(bytes32)") + cid))
+    if kind != 1:
+        sys.exit(f"{rel}: inode {cid} is not a file")
+    strategy = verify_file(chain, cid, stored, metadata, chunks)
     plain = gzip.decompress(stored) if stored[:2] == b"\x1f\x8b" else stored
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "wb") as f:
@@ -179,6 +241,9 @@ def walk(chain, cid, out, rel, manifest):
         {
             "path": rel.lstrip("/"),
             "inode": cid,
+            "verified": strategy,
+            "chunks": len(chunks),
+            "metadataHpackHex": metadata.hex(),
             "storedBytes": len(stored),
             "storedSha256": hashlib.sha256(stored).hexdigest(),
             "gzip": stored[:2] == b"\x1f\x8b",
@@ -186,7 +251,8 @@ def walk(chain, cid, out, rel, manifest):
             "sha256": hashlib.sha256(plain).hexdigest(),
         }
     )
-    print(f"{len(plain):>9}  {rel}  ({'gzip ' if stored[:2] == b'\\x1f\\x8b' else ''}inode {cid[:12]}…)")
+    gz = "gzip, " if stored[:2] == b"\x1f\x8b" else ""
+    print(f"{len(plain):>9}  {rel}  ({gz}{len(chunks)} chunks, verified by {strategy}; inode {cid[:12]}…)")
 
 
 def main():
@@ -207,7 +273,9 @@ def main():
         "chain": a.chain,
         "contract": chain.contract,
         "block": chain.block,
+        "verified": "every inode checksum recomputed from the bytes read (directory entries; file chunk list, metadata and content)",
         "files": manifest,
+    }
     }
     with open(os.path.join(a.outdir, "onchfs-read.json"), "w") as f:
         json.dump(rec, f, indent=2)
