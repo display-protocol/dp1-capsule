@@ -17,6 +17,11 @@ Only stdlib. Reads one JSON config on stdin, writes shot.png and render.json int
 import base64, http.server, json, os, re, secrets, select, socket, socketserver, struct, subprocess, sys, threading, time, fcntl, urllib.parse
 
 MAX_BODY = 200 * 1024 * 1024   # one DevTools message carries the body; larger captures are refused at import and here
+# response headers a replay may carry: the ones that change how the browser treats a response (FF OS offlinecache's
+# replayableResponseHeaders) plus the declared content type. Nothing else from a capture reaches the browser.
+REPLAY_HEADERS = {"access-control-allow-origin", "access-control-allow-credentials", "access-control-allow-methods",
+                  "access-control-allow-headers", "access-control-expose-headers", "cross-origin-resource-policy",
+                  "cross-origin-embedder-policy", "timing-allow-origin", "content-type"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DEBUG = bool(os.environ.get("DP1C_DEBUG"))
 
@@ -149,7 +154,7 @@ def main():
     frames, interval = int(cfg.get("frames") or 0), float(cfg.get("frameIntervalMs") or 16.667)
     nonce = secrets.token_hex(16)
     diag = {"loadFailures": [], "httpErrors": [], "exceptions": [], "consoleErrors": [], "replayMisses": [],
-            "replayed": 0, "entryFulfilled": False, "framesTicked": 0, "rafCallbacks": 0, "frameContexts": 0}
+            "replayed": 0, "entryFulfilled": False, "framesTicked": 0, "rafCallbacks": 0, "frameContexts": 0, "otherTargets": []}
     kept = []; inflight = {}; contexts = {}
     cdp.deadline = time.monotonic() + float(cfg.get("wallTimeoutSeconds") or 900)
     try:
@@ -170,12 +175,14 @@ def main():
                 res = table.get("GET " + u)                        # a HEAD is answered from the captured GET, body omitted
             if res is None or not isinstance(res.get("status"), int) or res["status"] <= 0:
                 fail(rid, key); return
-            headers = [{"name": k, "value": v} for k, v in (res.get("headers") or {}).items()]
+            headers = [{"name": k, "value": v} for k, v in (res.get("headers") or {}).items()
+                       if isinstance(k, str) and isinstance(v, str) and k.lower() in REPLAY_HEADERS]
             names = {h["name"].lower() for h in headers}
-            if res.get("contentType") and "content-type" not in names: headers.append({"name": "Content-Type", "value": res["contentType"]})
+            if res.get("contentType") and "content-type" not in names: headers.append({"name": "Content-Type", "value": str(res["contentType"])})
             params = {"requestId": rid, "responseCode": res["status"]}
             if res.get("redirectTo"):
-                if "location" not in names: headers.append({"name": "Location", "value": res["redirectTo"]})
+                if not (300 <= res["status"] <= 399) or not str(res["redirectTo"]).startswith(("http://", "https://")): fail(rid, key, "bad redirect"); return
+                headers.append({"name": "Location", "value": res["redirectTo"]})
             elif res.get("sha256") and not head:
                 sha = res["sha256"]
                 if not isinstance(sha, str) or not HEX64.match(sha): fail(rid, key, "bad digest"); return
@@ -196,11 +203,16 @@ def main():
                 if c.get("auxData", {}).get("isDefault"): contexts[c["id"]] = c.get("auxData", {}).get("frameId")
             elif m == "Runtime.executionContextDestroyed": contexts.pop(p.get("executionContextId"), None)
             elif m == "Runtime.executionContextsCleared": contexts.clear()
+            elif m == "Target.attachedToTarget":
+                ti = p.get("targetInfo", {}); diag["otherTargets"].append({"type": ti.get("type"), "url": ti.get("url")})
             if replay and m == "Fetch.requestPaused": answer(p)
             else: kept.append(e)
         cdp.handler = on_event
 
         S("Page.enable"); S("Network.enable"); S("Runtime.enable"); S("Log.enable")
+        # workers and out-of-process frames run outside this session's clock and interception; see them so the
+        # render record can say so (they are reported as a render problem, not silently accepted)
+        S("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
         S("Emulation.setDeviceMetricsOverride", {"width": vp["width"], "height": vp["height"],
                                                  "deviceScaleFactor": vp["deviceScaleFactor"], "mobile": False,
                                                  "screenWidth": vp["width"], "screenHeight": vp["height"]})
@@ -259,6 +271,10 @@ def main():
             S("Emulation.setVirtualTimePolicy", {"policy": "pauseIfNetworkFetchesPending", "budget": interval, "maxVirtualTimeTaskStarvationCount": 100000})
             cdp.run_until("Emulation.virtualTimeBudgetExpired", sid)
         diag["frameContexts"] = len(contexts)
+        # let anything already on the pipe land (a request paused in the last frame is answered here), then capture
+        quiet_until = time.monotonic() + 0.25
+        while time.monotonic() < quiet_until:
+            if select.select([cdp.r], [], [], 0.05)[0] or cdp.buf: cdp._pump(); cdp._deliver(); quiet_until = time.monotonic() + 0.25
         probe = S("Runtime.evaluate", {"expression": "JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio,now:Date.now(),hc:navigator.hardwareConcurrency,ua:navigator.userAgent,href:location.href,frames:window.frames.length})", "returnByValue": True})["result"]["value"]
         shot = S("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False, "fromSurface": True})["data"]
         gpu = cdp.send("SystemInfo.getInfo").get("gpu", {}).get("auxAttributes", {})

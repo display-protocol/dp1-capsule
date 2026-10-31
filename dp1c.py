@@ -35,6 +35,9 @@ MAX_CAPSULE_BYTES = 2 * 1024 ** 3
 MAX_MEMBERS = 50000
 MAX_BODY = 200 * 1024 * 1024   # largest response body a replay capsule may carry (one DevTools message each)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+REPLAY_HEADERS = {"access-control-allow-origin", "access-control-allow-credentials", "access-control-allow-methods",
+                  "access-control-allow-headers", "access-control-expose-headers", "cross-origin-resource-policy",
+                  "cross-origin-embedder-policy", "timing-allow-origin", "content-type"}
 VIRTUAL_EPOCH = 1_600_000_000  # 2020-09-13T12:26:40Z: the clock every render starts from
 
 # ---------- the engine pin ---------------------------------------------------
@@ -214,7 +217,10 @@ def render_problems(rj):
     http = [e for e in d["httpErrors"] if not e["url"].endswith("/favicon.ico")]
     misses = [m for m in d.get("replayMisses", []) if not m.endswith("/favicon.ico")]
     fails = [e for e in d["loadFailures"] if not (e.get("url") or "").endswith("/favicon.ico")]
-    return {"loadFailures": fails, "httpErrors": http, "exceptions": d["exceptions"], "replayMisses": misses}
+    other = [t for t in d.get("otherTargets", []) if t.get("type") not in ("page", "browser")]
+    return {"loadFailures": fails, "httpErrors": http, "exceptions": d["exceptions"], "replayMisses": misses,
+            "inflightAtCapture": d.get("inflightAtCapture", []),
+            "outsideEngineClock": other}   # workers / out-of-process frames: not ticked, not intercepted
 
 def replay_problems(rj, capture):
     """Replay-specific completeness: the main document must have come from the table and the page must have landed on
@@ -238,6 +244,11 @@ def check_capture(capture, manifest):
         seen.add(key)
         if (r.get("method") or "GET").upper() not in ("GET", "HEAD"): bad.append("unsupported method in " + key)
         if not isinstance(r.get("status"), int) or not (100 <= r["status"] <= 599): bad.append("bad status in " + key)
+        if r.get("redirectTo") and not (isinstance(r["status"], int) and 300 <= r["status"] <= 399 and str(r["redirectTo"]).startswith(("http://", "https://"))):
+            bad.append("redirect record without a 3xx status and an http(s) target: " + key)
+        if r.get("redirectTo") and r.get("sha256"): bad.append("record has both a redirect and a body: " + key)
+        for h in (r.get("headers") or {}):
+            if not isinstance(h, str) or h.lower() not in REPLAY_HEADERS: bad.append(f"header {h!r} is not replayable: " + key)
         sha = r.get("sha256")
         if sha is not None:
             if not isinstance(sha, str) or not HEX64.match(sha): bad.append("bad digest in " + key)
@@ -485,7 +496,9 @@ def cmd_import_capture(a):
         sys.exit("the device marked this capture incomplete (" + str(rec.get("coverage", {}).get("reason")) + "); pass --allow-incomplete to build anyway")
     resources = []
     for r in rec["resources"]:
-        keep = {k: r[k] for k in ("url", "status", "sha256", "contentType", "sniffedContentType", "redirectTo", "headers", "method") if r.get(k)}
+        keep = {k: r[k] for k in ("url", "status", "sha256", "contentType", "sniffedContentType", "redirectTo", "method") if r.get(k)}
+        hdrs = {k: v for k, v in (r.get("headers") or {}).items() if isinstance(k, str) and k.lower() in REPLAY_HEADERS}
+        if hdrs: keep["headers"] = hdrs
         if "status" not in keep: keep["status"] = r.get("status", 0)
         resources.append(keep)
     capture = {"entry": rec["entry"], "capturedAt": rec.get("capturedAt"), "coverage": rec.get("coverage"),
@@ -531,6 +544,7 @@ def cmd_verify(a):
             bad += check_capture(capture, ref["assets"])
             replay = {"entry": capture["entry"], "resources": capture["resources"]}
         elif ref.get("mode", "files") != "files": bad.append("unknown mode " + str(ref.get("mode")))
+        elif ref["entry"] not in ref["assets"]: bad.append("entry file is not in the asset manifest")
         if bad:
             # nothing from a capsule that fails its static checks is rendered
             print(json.dumps({"capsuleId": sha256_file(a.capsule), "assetsIntact": False, "assetProblems": bad, "verdict": "assetsCorrupt"}, indent=2)); sys.exit(2)
@@ -564,9 +578,10 @@ def cmd_verify(a):
         ham = bin(int(fh["phash"], 16) ^ int(want["phash"], 16)).count("1")
         problems = render_problems(rj)
         if capture: problems["replay"] = replay_problems(rj, capture)
-        # a render that failed to load something, threw, or (replay) did not come from the capture is not a reproduction,
-        # even if the pixels happen to match; the recorded problems of an --allow-render-errors build are the one exception
-        clean = not any(problems.values()) or canon(problems) == canon(ref.get("problems") or {})
+        # a render that failed to load something, threw, left requests in flight, ran code outside the engine's clock, or
+        # (replay) did not come from the capture is not a reproduction, even if the pixels match. A capsule built with
+        # --allow-render-errors carries its problems and is reported the same way: an acknowledged partial, never exit 0.
+        clean = not any(problems.values())
         sigs = check_signatures(a.capsule, a.sig)
         signer_ok = True
         if a.require_signer:
