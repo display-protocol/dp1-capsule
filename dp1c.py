@@ -70,12 +70,13 @@ def sha256_file(p):
 def canon(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-def engine_pin(version, viewport, budget_ms, image_ref):
+def engine_pin(version, viewport, budget_ms, image_ref, random_seed=None):
     return {
         "engine": "chromium", "version": version, "platform": "linux-x86_64", "renderer": "software",
         "flags": list(DETERMINISTIC_FLAGS), "env": dict(SANDBOX_ENV),
         "viewport": {"width": viewport[0], "height": viewport[1], "deviceScaleFactor": 1},
         "virtualEpochSeconds": VIRTUAL_EPOCH, "virtualTimeBudgetMs": budget_ms, "timezone": "UTC", "locale": "en-US",
+        "randomSeed": random_seed,   # None: the work's own randomness is left alone (on-chain gen art seeds itself)
         "network": "none",
         "harnessSha256": sha256_file(HARNESS),
         "imageRef": image_ref,
@@ -168,7 +169,7 @@ def render(root, assets_dir, entry, engine, outdir):
         cfg = {"out": outdir, "work": os.path.abspath(assets_dir), "entry": entry, "chromium": "/usr/bin/chromium",
                "flags": engine["flags"], "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
                "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
-               "cwd": "/tmp", "chromiumPrefix": []}
+               "randomSeed": engine.get("randomSeed"), "cwd": "/tmp", "chromiumPrefix": []}
         env = dict(SANDBOX_ENV); os.makedirs("/tmp/xdg", exist_ok=True); os.makedirs("/tmp/xdgc", exist_ok=True); os.makedirs("/tmp/run", exist_ok=True); os.makedirs("/tmp/profile", exist_ok=True)
         r = subprocess.run([sys.executable, HARNESS], input=canon(cfg), capture_output=True, text=True, timeout=1800, env=env)
         shot = os.path.join(outdir, "shot.png"); rj = os.path.join(outdir, "render.json")
@@ -185,7 +186,7 @@ def render(root, assets_dir, entry, engine, outdir):
     cfg = {"out": O, "work": W, "entry": entry, "chromium": chromium, "flags": engine["flags"],
            "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
            "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
-           "cwd": "/tmp",
+           "randomSeed": engine.get("randomSeed"), "cwd": "/tmp",
            # after loopback is up the harness launches chromium with every capability dropped
            "chromiumPrefix": ["/usr/bin/setpriv", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs"] if (setpriv and os.path.exists(setpriv)) else []}
     cmd = ["bwrap", *fs, "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
@@ -349,7 +350,7 @@ def cmd_build(a):
         root, version, image_ref = None, host_version(), None
     else:
         sys.exit("build needs --engine (pinned) or --host (unpinned, weaker claim)")
-    engine = engine_pin(version, viewport, a.budget, image_ref)
+    engine = engine_pin(version, viewport, a.budget, image_ref, a.pin_random)
 
     with tempfile.TemporaryDirectory() as stage, tempfile.TemporaryDirectory() as outdir:
         assets = os.path.join(stage, "assets"); shutil.copytree(work, assets)
@@ -461,7 +462,9 @@ def main():
     b.add_argument("--license", default="token"); b.add_argument("--duration", type=int, default=300)
     b.add_argument("--viewport", default="1920x1080"); b.add_argument("--budget", type=int, default=10000)
     b.add_argument("--engine"); b.add_argument("--host", action="store_true")
-    b.add_argument("--allow-render-errors", action="store_true"); b.set_defaults(f=cmd_build)
+    b.add_argument("--allow-render-errors", action="store_true")
+    b.add_argument("--pin-random", type=int, metavar="SEED", help="replace Math.random and crypto.getRandomValues with a seeded generator (for works that do not seed themselves)")
+    b.set_defaults(f=cmd_build)
     v = sp.add_parser("verify"); v.add_argument("capsule"); v.add_argument("--png"); v.add_argument("--engine")
     v.add_argument("--host", action="store_true"); v.add_argument("--allow-engine-mismatch", action="store_true")
     v.add_argument("--sig", help="signature sidecar (default: <capsule>.sig.json)")

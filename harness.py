@@ -91,6 +91,21 @@ def main():
         S("Emulation.setTimezoneOverride", {"timezoneId": cfg.get("timezone", "UTC")})
         S("Emulation.setLocaleOverride", {"locale": cfg.get("locale", "en-US")})
         S("Network.setCacheDisabled", {"cacheDisabled": True})
+        if cfg.get("randomSeed") is not None:
+            # Pin the two unseeded randomness sources before any page script runs. The work is untouched;
+            # the engine simply hands it a deterministic Math.random / crypto.getRandomValues for this seed.
+            seed = int(cfg["randomSeed"]) & 0xFFFFFFFF
+            S("Page.addScriptToEvaluateOnNewDocument", {"source": f"""
+(() => {{
+  let s = {seed} >>> 0;                       // mulberry32
+  const rnd = () => {{ s = (s + 0x6D2B79F5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1);
+                       t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }};
+  Object.defineProperty(Math, 'random', {{ value: rnd, writable: false, configurable: false }});
+  const grv = (arr) => {{ for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(rnd() * 256); return arr; }};
+  try {{ Object.defineProperty(crypto, 'getRandomValues', {{ value: grv, writable: false, configurable: false }}); }} catch (e) {{}}
+  try {{ Object.defineProperty(crypto, 'randomUUID', {{ value: () => {{ const b = grv(new Uint8Array(16)); b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+        const h = [...b].map(x => x.toString(16).padStart(2, '0')).join(''); return `${{h.slice(0,8)}}-${{h.slice(8,12)}}-${{h.slice(12,16)}}-${{h.slice(16,20)}}-${{h.slice(20)}}`; }}, writable: false, configurable: false }}); }} catch (e) {{}}
+}})();"""})
         # clock: paused at a fixed epoch before the page exists
         S("Emulation.setVirtualTimePolicy", {"policy": "pause", "initialVirtualTime": cfg["virtualEpochSeconds"]})
         S("Page.navigate", {"url": url})
