@@ -8,17 +8,19 @@ Prototype. Fills the lines DP-1 v1.1.0 leaves blank:
                              with the network unshared, the clock pinned, the viewport set before navigation
 
 Commands
-  build   WORKDIR --engine ENGINE --out X.dp1c [--entry index.html] [--title ..] [--source URL]
-          [--provenance p.json] [--seed 0x..] [--created ISO] [--host]
-  verify  X.dp1c [--engine ENGINE] [--host] [--png out.png]
-  info    X.dp1c
+  build           WORKDIR --engine ENGINE --out X.dp1c [--entry index.html] [--title ..] [--source URL]
+                  [--provenance p.json] [--seed 0x..] [--created ISO] [--host]
+  import-capture  --cache-root DIR --source URL --engine ENGINE --out X.dp1c
+                  (a capture FF OS already made: items/<sha256(source)>.json + blobs/; the capsule replays it)
+  verify          X.dp1c [--engine ENGINE] [--host] [--png out.png]
+  info            X.dp1c
 
 ENGINE is an engine-<sha>.tar.zst from engine/build-engine.sh, a bare sha already in the cache, or a rootfs
 directory (unpinned: reported as a different engine). --host runs this machine's chromium outside the engine
 sandbox; it is a weaker claim and is always reported as such.
 Only stdlib + zstandard + Pillow + bubblewrap. No Feral File service anywhere.
 """
-import argparse, base64, hashlib, io, json, os, platform, shlex, shutil, subprocess, sys, tarfile, tempfile, uuid
+import argparse, base64, hashlib, io, json, os, platform, re, shlex, shutil, subprocess, sys, tarfile, tempfile, uuid
 from datetime import datetime, timezone
 
 import zstandard
@@ -31,6 +33,8 @@ CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser") or shuti
 ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
 MAX_CAPSULE_BYTES = 2 * 1024 ** 3
 MAX_MEMBERS = 50000
+MAX_BODY = 200 * 1024 * 1024   # largest response body a replay capsule may carry (one DevTools message each)
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 VIRTUAL_EPOCH = 1_600_000_000  # 2020-09-13T12:26:40Z: the clock every render starts from
 
 # ---------- the engine pin ---------------------------------------------------
@@ -70,12 +74,14 @@ def sha256_file(p):
 def canon(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-def engine_pin(version, viewport, budget_ms, image_ref, random_seed=None):
+def engine_pin(version, viewport, budget_ms, image_ref, random_seed=None, frames=60, frame_interval_ms=16.667):
     return {
         "engine": "chromium", "version": version, "platform": "linux-x86_64", "renderer": "software",
         "flags": list(DETERMINISTIC_FLAGS), "env": dict(SANDBOX_ENV),
         "viewport": {"width": viewport[0], "height": viewport[1], "deviceScaleFactor": 1},
         "virtualEpochSeconds": VIRTUAL_EPOCH, "virtualTimeBudgetMs": budget_ms, "timezone": "UTC", "locale": "en-US",
+        # the frame schedule: after the settle budget, exactly this many animation frames at this interval, then freeze
+        "frames": frames, "frameIntervalMs": frame_interval_ms, "hardwareConcurrency": 4,
         "randomSeed": random_seed,   # None: the work's own randomness is left alone (on-chain gen art seeds itself)
         "network": "none",
         "harnessSha256": sha256_file(HARNESS),
@@ -157,10 +163,11 @@ def _ver(s):
 
 # ---------- render ----------------------------------------------------------
 
-def render(root, assets_dir, entry, engine, outdir):
+def render(root, assets_dir, entry, engine, outdir, replay=None):
     """Run harness.py under bubblewrap with the network namespace unshared. root is the pinned engine rootfs, or None
     for the host's own filesystem and chromium (--host: a different-engine comparison, never 'reproduced').
-    Writes shot.png + render.json into outdir, a fresh directory that is not inside the capsule."""
+    replay: {"entry": url, "resources": [...]} for a captured work (assets are blobs named by sha256; the harness answers
+    the page's requests from the table). Writes shot.png + render.json into outdir, a fresh directory outside the capsule."""
     for f in ("shot.png", "render.json"):
         if os.path.exists(os.path.join(outdir, f)): os.remove(os.path.join(outdir, f))
     hdir = os.path.join(outdir, "_harness"); os.makedirs(hdir, exist_ok=True); shutil.copy(HARNESS, os.path.join(hdir, "harness.py"))
@@ -169,12 +176,13 @@ def render(root, assets_dir, entry, engine, outdir):
         cfg = {"out": outdir, "work": os.path.abspath(assets_dir), "entry": entry, "chromium": "/usr/bin/chromium",
                "flags": engine["flags"], "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
                "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
-               "randomSeed": engine.get("randomSeed"), "cwd": "/tmp", "chromiumPrefix": []}
+               "randomSeed": engine.get("randomSeed"), "frames": engine.get("frames"), "frameIntervalMs": engine.get("frameIntervalMs"), "hardwareConcurrency": engine.get("hardwareConcurrency"), "cwd": "/tmp", "chromiumPrefix": [], "replay": replay,
+               "wallTimeoutSeconds": int(os.environ.get("DP1C_WALL_SECONDS", "900")), "debug": bool(os.environ.get("DP1C_DEBUG"))}
         env = dict(SANDBOX_ENV); os.makedirs("/tmp/xdg", exist_ok=True); os.makedirs("/tmp/xdgc", exist_ok=True); os.makedirs("/tmp/run", exist_ok=True); os.makedirs("/tmp/profile", exist_ok=True)
         r = subprocess.run([sys.executable, HARNESS], input=canon(cfg), capture_output=True, text=True, timeout=1800, env=env)
         shot = os.path.join(outdir, "shot.png"); rj = os.path.join(outdir, "render.json")
         if r.returncode != 0 or not os.path.isfile(shot) or not os.path.isfile(rj):
-            sys.exit(f"render failed (exit {r.returncode}):\n{r.stderr[-3000:]}")
+            sys.exit(f"render failed (exit {r.returncode}):\n{r.stderr if os.environ.get('DP1C_DEBUG') else r.stderr[-3000:]}")
         return open(shot, "rb").read(), json.load(open(rj))
     if root:
         fs = ["--ro-bind", root, "/"]; W, O, H = "/work", "/out", "/harness"; chromium, python = "/usr/bin/chromium", "/usr/bin/python"
@@ -186,7 +194,8 @@ def render(root, assets_dir, entry, engine, outdir):
     cfg = {"out": O, "work": W, "entry": entry, "chromium": chromium, "flags": engine["flags"],
            "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
            "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
-           "randomSeed": engine.get("randomSeed"), "cwd": "/tmp",
+           "randomSeed": engine.get("randomSeed"), "frames": engine.get("frames"), "frameIntervalMs": engine.get("frameIntervalMs"), "hardwareConcurrency": engine.get("hardwareConcurrency"), "cwd": "/tmp", "replay": replay,
+           "wallTimeoutSeconds": int(os.environ.get("DP1C_WALL_SECONDS", "900")), "debug": bool(os.environ.get("DP1C_DEBUG")),
            # after loopback is up the harness launches chromium with every capability dropped
            "chromiumPrefix": ["/usr/bin/setpriv", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs"] if (setpriv and os.path.exists(setpriv)) else []}
     cmd = ["bwrap", *fs, "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
@@ -197,13 +206,61 @@ def render(root, assets_dir, entry, engine, outdir):
     r = subprocess.run(cmd, input=canon(cfg), capture_output=True, text=True, timeout=1800)
     shot = os.path.join(outdir, "shot.png"); rj = os.path.join(outdir, "render.json")
     if r.returncode != 0 or not os.path.isfile(shot) or not os.path.isfile(rj):
-        sys.exit(f"render failed (exit {r.returncode}):\n{r.stderr[-3000:]}")
+        sys.exit(f"render failed (exit {r.returncode}):\n{r.stderr if os.environ.get('DP1C_DEBUG') else r.stderr[-3000:]}")
     return open(shot, "rb").read(), json.load(open(rj))
 
 def render_problems(rj):
     d = rj["diagnostics"]
     http = [e for e in d["httpErrors"] if not e["url"].endswith("/favicon.ico")]
-    return {"loadFailures": d["loadFailures"], "httpErrors": http, "exceptions": d["exceptions"]}
+    misses = [m for m in d.get("replayMisses", []) if not m.endswith("/favicon.ico")]
+    fails = [e for e in d["loadFailures"] if not (e.get("url") or "").endswith("/favicon.ico")]
+    return {"loadFailures": fails, "httpErrors": http, "exceptions": d["exceptions"], "replayMisses": misses}
+
+def replay_problems(rj, capture):
+    """Replay-specific completeness: the main document must have come from the table and the page must have landed on
+    a captured URL. Without this a capsule could name a work, replay nothing, and match a reference of nothing."""
+    out = []
+    d, page = rj["diagnostics"], rj.get("page", {})
+    if not d.get("entryFulfilled"): out.append("the entry document was not served from the capture")
+    urls = {r["url"] for r in capture["resources"]}
+    if page.get("href") not in urls: out.append(f"page landed on {page.get('href')}, not a captured URL")
+    return out
+
+def check_capture(capture, manifest):
+    """Static checks on a replay table against the asset manifest, done before anything is rendered."""
+    bad = []
+    e = capture.get("entry") or ""
+    if not (e.startswith("https://") or e.startswith("http://")): bad.append("capture entry is not an http(s) URL")
+    seen = set()
+    for r in capture.get("resources", []):
+        key = (r.get("method") or "GET").upper() + " " + str(r.get("url"))
+        if key in seen: bad.append("duplicate resource " + key)
+        seen.add(key)
+        if (r.get("method") or "GET").upper() not in ("GET", "HEAD"): bad.append("unsupported method in " + key)
+        if not isinstance(r.get("status"), int) or not (100 <= r["status"] <= 599): bad.append("bad status in " + key)
+        sha = r.get("sha256")
+        if sha is not None:
+            if not isinstance(sha, str) or not HEX64.match(sha): bad.append("bad digest in " + key)
+            elif manifest is not None and manifest.get(sha) != sha: bad.append(f"resource {r.get('url')} names a body that is not assets/{sha}")
+    if ("GET " + e) not in seen: bad.append("capture has no GET record for its entry")
+    if manifest is not None:
+        used = {r.get("sha256") for r in capture.get("resources", [])}
+        bad += [f"assets/{k} is not referenced by any captured resource" for k in sorted(manifest) if k not in used]
+    return bad
+
+def check_pin(engine):
+    """The engine layer is capsule data; only sane values reach the harness."""
+    bad = []
+    vp = engine.get("viewport") or {}
+    if not all(isinstance(vp.get(k), int) and 1 <= vp[k] <= 16384 for k in ("width", "height")): bad.append("viewport out of range")
+    if vp.get("deviceScaleFactor") != 1: bad.append("deviceScaleFactor must be 1")
+    f = engine.get("frames", 0); iv = engine.get("frameIntervalMs", 16.667)
+    if not isinstance(f, int) or not (0 <= f <= 100000): bad.append("frames out of range")
+    if not isinstance(iv, (int, float)) or not (1 <= iv <= 1000): bad.append("frameIntervalMs out of range")
+    b = engine.get("virtualTimeBudgetMs")
+    if not isinstance(b, int) or not (0 <= b <= 3600000): bad.append("virtualTimeBudgetMs out of range")
+    if engine.get("randomSeed") is not None and not isinstance(engine["randomSeed"], int): bad.append("randomSeed must be an integer")
+    return bad
 
 def dhash(im, size=8):
     g = im.convert("L").resize((size + 1, size), Image.LANCZOS)
@@ -317,10 +374,10 @@ def cmd_sign(a):
 
 def check_signatures(capsule_path, sig_path=None):
     """Return (list of {kid, role, ts, valid, reason}) for the sidecar, or [] if there is none."""
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.exceptions import InvalidSignature
     side = sig_path or sig_sidecar(capsule_path)
     if not os.path.exists(side): return []
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.exceptions import InvalidSignature
     cid = sha256_file(capsule_path); doc = json.load(open(side)); out = []
     for x in doc.get("signatures", []):
         r = {"kid": x.get("kid"), "role": x.get("role"), "ts": x.get("ts"), "valid": False, "reason": ""}
@@ -336,10 +393,7 @@ def check_signatures(capsule_path, sig_path=None):
 
 # ---------- commands --------------------------------------------------------
 
-def cmd_build(a):
-    work = os.path.abspath(a.workdir)
-    if not os.path.isfile(os.path.join(work, a.entry)): sys.exit(f"entry {a.entry} not in {work}")
-    if "/" in a.entry or a.entry.startswith("."): sys.exit("entry must be a plain file name at the asset root")
+def open_engine_for_build(a):
     viewport = tuple(int(x) for x in a.viewport.split("x"))
     if a.engine:
         root, sha, man = engine_open(a.engine)
@@ -350,39 +404,106 @@ def cmd_build(a):
         root, version, image_ref = None, host_version(), None
     else:
         sys.exit("build needs --engine (pinned) or --host (unpinned, weaker claim)")
-    engine = engine_pin(version, viewport, a.budget, image_ref, a.pin_random)
+    engine = engine_pin(version, viewport, a.budget, image_ref, a.pin_random, a.frames, a.frame_interval)
+    bad = check_pin(engine)
+    if bad: sys.exit("bad render settings: " + "; ".join(bad))
+    return root, version, image_ref, engine
 
-    with tempfile.TemporaryDirectory() as stage, tempfile.TemporaryDirectory() as outdir:
-        assets = os.path.join(stage, "assets"); shutil.copytree(work, assets)
-        asset_hashes = {k: sha256_file(os.path.join(assets, k)) for k in walk_files(assets)}
-        png, rj = render(root, assets, a.entry, engine, outdir)
-        problems = render_problems(rj)
-        if any(problems.values()) and not a.allow_render_errors:
-            sys.exit("the work did not render cleanly; capsule not written:\n" + canon(problems) +
-                     "\n(pass --allow-render-errors to record them in the capsule anyway)")
-        fh = frame_hash(png, engine["viewport"])
-        now = a.created or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        fingerprint = (a.source or a.entry) + "|" + "|".join(f"{k}={asset_hashes[k]}" for k in sorted(asset_hashes))
-        item = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, "dp1c:item:" + fingerprint)), "title": a.title,
-                "source": a.source or f"dp1c:assets/{a.entry}", "duration": a.duration, "license": a.license,
-                "repro": {"engineVersion": {"chromium": version}, **({"seed": a.seed} if a.seed else {}),
-                          "assetsSHA256": [asset_hashes[k] for k in sorted(asset_hashes)],
-                          "frameHash": {"sha256": fh["sha256"], "phash": fh["phash"]}}}
-        if a.provenance: item["provenance"] = json.load(open(a.provenance))
-        playlist = {"dpVersion": DP_VERSION, "id": str(uuid.uuid5(uuid.NAMESPACE_URL, "dp1c:playlist:" + fingerprint)),
-                    "title": a.title, "created": now, "defaults": {"display": {"scaling": "fit", "background": "#000000"}},
-                    "items": [item]}
-        os.makedirs(os.path.join(stage, "meta", "engine")); os.makedirs(os.path.join(stage, "meta", "render"))
-        open(os.path.join(stage, "playlist.json"), "w").write(canon(playlist))
-        open(os.path.join(stage, "meta", "engine", "chromium.json"), "w").write(canon(engine))
-        open(os.path.join(stage, "meta", "render", "reference.json"), "w").write(canon(
-            {"entry": a.entry, "assets": asset_hashes, "renderedAt": now, "frame": fh, "page": rj["page"],
-             "glRenderer": rj.get("glRenderer"), "problems": problems, "png": "meta/render/reference.png"}))
-        shutil.copy(os.path.join(outdir, "shot.png"), os.path.join(stage, "meta", "render", "reference.png"))
-        cid = pack(stage, a.out)
+def write_capsule(a, stage, outdir, root, version, image_ref, engine, entry, item_base, source, capture=None):
+    """Render the staged assets/ and finish the capsule. entry is a file name (files mode) or the work's URL (replay mode,
+    when capture is the resources record). item_base is the DP-1 item to carry (verbatim from a device record, or built
+    from the build flags); repro and a content-derived id are added here."""
+    assets = os.path.join(stage, "assets")
+    asset_hashes = {k: sha256_file(os.path.join(assets, k)) for k in walk_files(assets)}
+    replay = {"entry": entry, "resources": capture["resources"]} if capture else None
+    png, rj = render(root, assets, entry, engine, outdir, replay)
+    problems = render_problems(rj)
+    if capture: problems["replay"] = replay_problems(rj, capture)
+    if any(problems.values()) and not a.allow_render_errors:
+        sys.exit("the work did not render cleanly; capsule not written:\n" + canon(problems) +
+                 "\n(pass --allow-render-errors to record them in the capsule anyway)")
+    fh = frame_hash(png, engine["viewport"])
+    now = a.created or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fingerprint = source + "|" + "|".join(f"{k}={asset_hashes[k]}" for k in sorted(asset_hashes))
+    item = {**item_base, "id": str(uuid.uuid5(uuid.NAMESPACE_URL, "dp1c:item:" + fingerprint)), "source": source,
+            "repro": {"engineVersion": {"chromium": version}, **({"seed": a.seed} if a.seed else {}),
+                      "assetsSHA256": [asset_hashes[k] for k in sorted(asset_hashes)],
+                      "frameHash": {"sha256": fh["sha256"], "phash": fh["phash"]}}}
+    if a.provenance: item["provenance"] = json.load(open(a.provenance))
+    playlist = {"dpVersion": DP_VERSION, "id": str(uuid.uuid5(uuid.NAMESPACE_URL, "dp1c:playlist:" + fingerprint)),
+                "title": item.get("title") or a.title, "created": now, "defaults": {"display": {"scaling": "fit", "background": "#000000"}},
+                "items": [item]}
+    os.makedirs(os.path.join(stage, "meta", "engine")); os.makedirs(os.path.join(stage, "meta", "render"))
+    open(os.path.join(stage, "playlist.json"), "w").write(canon(playlist))
+    open(os.path.join(stage, "meta", "engine", "chromium.json"), "w").write(canon(engine))
+    if capture:
+        os.makedirs(os.path.join(stage, "meta", "capture"))
+        open(os.path.join(stage, "meta", "capture", "resources.json"), "w").write(canon(capture))
+    open(os.path.join(stage, "meta", "render", "reference.json"), "w").write(canon(
+        {"mode": "replay" if capture else "files", "entry": entry, "assets": asset_hashes, "renderedAt": now, "frame": fh,
+         "page": rj["page"], "glRenderer": rj.get("glRenderer"), "problems": problems, "png": "meta/render/reference.png",
+         **({"capture": "meta/capture/resources.json"} if capture else {})}))
+    shutil.copy(os.path.join(outdir, "shot.png"), os.path.join(stage, "meta", "render", "reference.png"))
+    cid = pack(stage, a.out)
     print(json.dumps({"capsule": a.out, "capsuleId": cid, "frameHash": fh["sha256"], "phash": fh["phash"],
-                      "engine": version, "engineImage": (image_ref or {}).get("sha256"),
-                      "ranInsideEngine": root is not None, "problems": problems, "assets": len(asset_hashes)}, indent=2))
+                      "engine": version, "engineImage": (image_ref or {}).get("sha256"), "mode": "replay" if capture else "files",
+                      "ranInsideEngine": root is not None, "problems": problems, "assets": len(asset_hashes),
+                      **({"replayed": rj["diagnostics"].get("replayed")} if capture else {})}, indent=2))
+
+def cmd_build(a):
+    work = os.path.abspath(a.workdir)
+    if not os.path.isfile(os.path.join(work, a.entry)): sys.exit(f"entry {a.entry} not in {work}")
+    if "/" in a.entry or a.entry.startswith("."): sys.exit("entry must be a plain file name at the asset root")
+    root, version, image_ref, engine = open_engine_for_build(a)
+    with tempfile.TemporaryDirectory() as stage, tempfile.TemporaryDirectory() as outdir:
+        shutil.copytree(work, os.path.join(stage, "assets"))
+        item_base = {"title": a.title, "duration": a.duration, "license": a.license}
+        write_capsule(a, stage, outdir, root, version, image_ref, engine, a.entry, item_base, a.source or f"dp1c:assets/{a.entry}")
+
+def load_capture_record(path):
+    """An FF OS offline-cache item record (items/<sha256(source)>.json), with or without the automatic-cache wrapper."""
+    rec = json.load(open(path))
+    if "record" in rec and "automaticCacheVersion" in rec: rec = rec["record"]
+    for k in ("item", "entry", "resources"):
+        if k not in rec: sys.exit(f"{path}: not an offline-cache item record (missing {k})")
+    return rec
+
+def cmd_import_capture(a):
+    """Turn a capture the device already made (FF OS feral-controld offlinecache store) into a capsule.
+    Layout read: <root>/items/<sha256(source)>.json + <root>/blobs/<sha256>. Nothing in the store is modified."""
+    if a.record:
+        rec_path, blobs = a.record, a.blobs or os.path.join(os.path.dirname(os.path.dirname(a.record)), "blobs")
+    else:
+        if not (a.cache_root and a.source): sys.exit("import-capture needs --cache-root and --source, or --record (and --blobs)")
+        rec_path = os.path.join(a.cache_root, "items", hashlib.sha256(a.source.encode()).hexdigest() + ".json")
+        blobs = os.path.join(a.cache_root, "blobs")
+        if not os.path.isfile(rec_path): sys.exit(f"no capture for {a.source} in {a.cache_root} (expected {rec_path})")
+    rec = load_capture_record(rec_path)
+    source = rec["item"].get("source")
+    if a.source and source != a.source: sys.exit(f"record is for {source}, not {a.source}")
+    if not rec.get("coverage", {}).get("complete") and not a.allow_incomplete:
+        sys.exit("the device marked this capture incomplete (" + str(rec.get("coverage", {}).get("reason")) + "); pass --allow-incomplete to build anyway")
+    resources = []
+    for r in rec["resources"]:
+        keep = {k: r[k] for k in ("url", "status", "sha256", "contentType", "sniffedContentType", "redirectTo", "headers", "method") if r.get(k)}
+        if "status" not in keep: keep["status"] = r.get("status", 0)
+        resources.append(keep)
+    capture = {"entry": rec["entry"], "capturedAt": rec.get("capturedAt"), "coverage": rec.get("coverage"),
+               "capturedBy": a.captured_by, "resources": resources}
+    bad = check_capture(capture, None)
+    if bad: sys.exit("this capture cannot be a capsule (prototype limits: GET/HEAD only, one record per method+URL, bodies under %d MB):\n  " % (MAX_BODY >> 20) + "\n  ".join(bad))
+    root, version, image_ref, engine = open_engine_for_build(a)
+    with tempfile.TemporaryDirectory() as stage, tempfile.TemporaryDirectory() as outdir:
+        assets = os.path.join(stage, "assets"); os.makedirs(assets)
+        for sha in sorted({r["sha256"] for r in resources if r.get("sha256")}):
+            src = os.path.join(blobs, sha)
+            if not os.path.isfile(src): sys.exit(f"blob {sha} missing from {blobs}")
+            if os.path.getsize(src) > MAX_BODY: sys.exit(f"blob {sha} is {os.path.getsize(src) >> 20} MB; bodies over {MAX_BODY >> 20} MB are not supported in this prototype")
+            if sha256_file(src) != sha: sys.exit(f"blob {sha} does not hash to its name; the store is corrupt")
+            shutil.copy(src, os.path.join(assets, sha))
+        item_base = {k: v for k, v in rec["item"].items() if k not in ("id", "repro")}
+        item_base.setdefault("title", a.title); item_base.setdefault("duration", a.duration); item_base.setdefault("license", a.license)
+        write_capsule(a, stage, outdir, root, version, image_ref, engine, rec["entry"], item_base, source, capture)
 
 def cmd_verify(a):
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outdir:
@@ -400,6 +521,19 @@ def cmd_verify(a):
         ref_png = frame_hash(open(os.path.join(d, "meta", "render", "reference.png"), "rb").read(), engine["viewport"])
         if not (ref_png["sha256"] == ref["frame"]["sha256"] == want["sha256"] and ref_png["phash"] == ref["frame"]["phash"] == want["phash"]):
             bad.append("reference frame records disagree (playlist / reference.json / reference.png)")
+        bad += check_pin(engine)
+        capture, replay = None, None
+        if ref.get("mode") == "replay":
+            capture = json.load(open(os.path.join(d, "meta", "capture", "resources.json")))
+            if capture.get("entry") != ref["entry"]: bad.append("capture entry disagrees with reference.json")
+            if item["source"] != capture.get("entry") and not any(r["url"] == item["source"] for r in capture["resources"]):
+                bad.append("playlist source is neither the capture entry nor a captured URL")
+            bad += check_capture(capture, ref["assets"])
+            replay = {"entry": capture["entry"], "resources": capture["resources"]}
+        elif ref.get("mode", "files") != "files": bad.append("unknown mode " + str(ref.get("mode")))
+        if bad:
+            # nothing from a capsule that fails its static checks is rendered
+            print(json.dumps({"capsuleId": sha256_file(a.capsule), "assetsIntact": False, "assetProblems": bad, "verdict": "assetsCorrupt"}, indent=2)); sys.exit(2)
         # 2. engine: computed digest is the only thing trusted
         pinned_img = (engine.get("imageRef") or {}).get("sha256")
         root, here_img = None, None
@@ -423,17 +557,23 @@ def cmd_verify(a):
         run_engine = {**engine, "flags": list(DETERMINISTIC_FLAGS), "env": dict(SANDBOX_ENV)}
         here_ver = _ver(subprocess.run(["/usr/bin/chromium", "--version"], capture_output=True, text=True).stdout) if root == "CONTAINER" \
                    else (engine_version(root) if root else host_version())
-        png, rj = render(root, os.path.join(d, "assets"), ref["entry"], run_engine, outdir)
+        png, rj = render(root, os.path.join(d, "assets"), ref["entry"], run_engine, outdir, replay)
         if a.png: shutil.copy(os.path.join(outdir, "shot.png"), a.png)
         fh = frame_hash(png, engine["viewport"])
         exact = fh["sha256"] == want["sha256"]
         ham = bin(int(fh["phash"], 16) ^ int(want["phash"], 16)).count("1")
+        problems = render_problems(rj)
+        if capture: problems["replay"] = replay_problems(rj, capture)
+        # a render that failed to load something, threw, or (replay) did not come from the capture is not a reproduction,
+        # even if the pixels happen to match; the recorded problems of an --allow-render-errors build are the one exception
+        clean = not any(problems.values()) or canon(problems) == canon(ref.get("problems") or {})
         sigs = check_signatures(a.capsule, a.sig)
         signer_ok = True
         if a.require_signer:
             signer_ok = any(x["valid"] and x["kid"] == a.require_signer for x in sigs)
         if bad: verdict = "assetsCorrupt"
         elif not signer_ok: verdict = "unsigned" if not sigs else "signatureInvalid"
+        elif not clean: verdict = "renderProblems"
         elif exact: verdict = "reproduced" if (engine_match and harness_match) else "reproducedOnDifferentEngine"
         elif ham <= 4 and not engine_match: verdict = "nearOnDifferentEngine"
         else: verdict = "reproMismatch"
@@ -443,7 +583,8 @@ def cmd_verify(a):
                           "sandbox": "container" if root == "CONTAINER" else ("bwrap" if root else "bwrap-host"),
                           "harnessMatch": harness_match,
                           "frameHashExpected": want["sha256"], "frameHashHere": fh["sha256"], "exact": exact,
-                          "phashDistance": ham, "renderProblems": render_problems(rj),
+                          "phashDistance": ham, "renderProblems": problems, "replayed": rj["diagnostics"].get("replayed"),
+                          "framesTicked": rj["diagnostics"].get("framesTicked"), "rafCallbacks": rj["diagnostics"].get("rafCallbacks"),
                           "signatures": sigs, "requiredSigner": a.require_signer, "verdict": verdict}, indent=2))
         sys.exit(0 if verdict == "reproduced" else 2)
 
@@ -452,19 +593,33 @@ def cmd_info(a):
         unpack(a.capsule, d)
         for p in ("playlist.json", "meta/engine/chromium.json", "meta/render/reference.json"):
             print(f"--- {p}"); print(json.dumps(json.load(open(os.path.join(d, p))), indent=2, sort_keys=True))
+        cp = os.path.join(d, "meta", "capture", "resources.json")
+        if os.path.exists(cp):
+            c = json.load(open(cp)); print("--- meta/capture/resources.json")
+            print(json.dumps({k: v for k, v in c.items() if k != "resources"}, indent=2, sort_keys=True))
+            for r in c["resources"]: print(f"  {r.get('method') or 'GET'} {r['status']} {r.get('contentType') or '-'} {r['url']}" + (f" -> {r['redirectTo']}" if r.get("redirectTo") else ""))
 
 def main():
     p = argparse.ArgumentParser(prog="dp1c"); sp = p.add_subparsers(dest="cmd", required=True)
-    b = sp.add_parser("build"); b.add_argument("workdir"); b.add_argument("--entry", default="index.html")
-    b.add_argument("--out", required=True); b.add_argument("--title", default="Untitled")
-    b.add_argument("--source"); b.add_argument("--provenance"); b.add_argument("--seed")
-    b.add_argument("--created", help="fixed timestamp for reproducible packing")
-    b.add_argument("--license", default="token"); b.add_argument("--duration", type=int, default=300)
-    b.add_argument("--viewport", default="1920x1080"); b.add_argument("--budget", type=int, default=10000)
-    b.add_argument("--engine"); b.add_argument("--host", action="store_true")
-    b.add_argument("--allow-render-errors", action="store_true")
-    b.add_argument("--pin-random", type=int, metavar="SEED", help="replace Math.random and crypto.getRandomValues with a seeded generator (for works that do not seed themselves)")
-    b.set_defaults(f=cmd_build)
+    def build_args(x):
+        x.add_argument("--out", required=True); x.add_argument("--title", default="Untitled")
+        x.add_argument("--provenance"); x.add_argument("--seed")
+        x.add_argument("--created", help="fixed timestamp for reproducible packing")
+        x.add_argument("--license", default="token"); x.add_argument("--duration", type=int, default=300)
+        x.add_argument("--viewport", default="1920x1080"); x.add_argument("--budget", type=int, default=10000, help="settle budget in virtual ms before the first frame")
+        x.add_argument("--frames", type=int, default=60, help="animation frames to run before the capture (the frame schedule)")
+        x.add_argument("--frame-interval", type=float, default=16.667, metavar="MS")
+        x.add_argument("--engine"); x.add_argument("--host", action="store_true")
+        x.add_argument("--allow-render-errors", action="store_true")
+        x.add_argument("--pin-random", type=int, metavar="SEED", help="replace Math.random and crypto.getRandomValues with a seeded generator (for works that do not seed themselves)")
+    b = sp.add_parser("build", help="capsule from a directory of files"); b.add_argument("workdir"); b.add_argument("--entry", default="index.html")
+    b.add_argument("--source"); build_args(b); b.set_defaults(f=cmd_build)
+    c = sp.add_parser("import-capture", help="capsule from a capture the device already made (FF OS offline-artworks store)")
+    c.add_argument("--cache-root", help="the store root (device default /home/feralfile/.cache/offline-artworks)")
+    c.add_argument("--source", help="the item's source URL, exactly as in the playlist (the store is keyed by its sha256)")
+    c.add_argument("--record", help="or: one items/<key>.json file"); c.add_argument("--blobs", help="blobs/ directory when --record is used (default: ../blobs)")
+    c.add_argument("--allow-incomplete", action="store_true"); c.add_argument("--captured-by", default="feral-controld offlinecache")
+    build_args(c); c.set_defaults(f=cmd_import_capture)
     v = sp.add_parser("verify"); v.add_argument("capsule"); v.add_argument("--png"); v.add_argument("--engine")
     v.add_argument("--host", action="store_true"); v.add_argument("--allow-engine-mismatch", action="store_true")
     v.add_argument("--sig", help="signature sidecar (default: <capsule>.sig.json)")

@@ -90,8 +90,8 @@ for line in open(pkfile).read().splitlines():
     pk[n] = v
 files = {}
 for line in open(sys.argv[7]).read().splitlines():
-    f, h = line.split()
-    files[f] = h
+    fname, fhash = line.split()
+    files[fname] = fhash
 json.dump({
   "engine": "chromium", "version": pk["chromium"].rsplit("-", 1)[0], "platform": "linux-x86_64",
   "imageRef": {"sha256": h, "format": "tar+zstd rootfs", "source": "https://archive.archlinux.org/repos/%s/" % date,

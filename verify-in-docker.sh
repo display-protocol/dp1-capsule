@@ -13,7 +13,12 @@ PINNED="$(zstd -d -c "$CAP" | tar -xO meta/engine/chromium.json | python3 -c 'im
 echo "engine file sha256: $SHA"; echo "capsule pins:       $PINNED"
 [ "$SHA" = "$PINNED" ] || { echo "engine image does not match the capsule's pin"; exit 1; }
 TAG="dp1c-engine:$SHA"
-docker image inspect "$TAG" >/dev/null 2>&1 || { echo ">> importing engine (one time)"; zstd -d -c "$IMG" | docker import --platform linux/amd64 - "$TAG" >/dev/null; }
+if docker image inspect "$TAG" >/dev/null 2>&1; then
+  LABEL="$(docker image inspect --format '{{ index .Config.Labels "dp1c.engine" }}' "$TAG")"
+  [ "$LABEL" = "$SHA" ] || { echo "local image $TAG is not labelled as this engine (label: $LABEL); remove it and rerun"; exit 1; }
+else
+  echo ">> importing engine (one time)"; zstd -d -c "$IMG" | docker import --platform linux/amd64 --change "LABEL dp1c.engine=$SHA" - "$TAG" >/dev/null
+fi
 WORK="$(mktemp -d)"; cp "$CAP" "$WORK/capsule.dp1c"; [ -n "$SIG" ] && cp "$SIG" "$WORK/capsule.dp1c.sig.json"
 cp "$HERE/dp1c.py" "$HERE/harness.py" "$WORK/"
 echo ">> verifying inside the container, network none"

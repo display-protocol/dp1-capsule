@@ -3,7 +3,7 @@
   "version": "155.0.8059.84",
   "platform": "linux-x86_64",
   "imageRef": {
-    "sha256": "d4cf0049137124c8a025eedfad267a3e8a02310c9efb9d1ae4a61aa1d02789fc",
+    "sha256": "f0d8ced301b3ff85d6e94dbac22ecd991c5a978e03c8af5e003a6f4a5390d400",
     "format": "tar+zstd rootfs",
     "source": "https://archive.archlinux.org/repos/2026/10/20/",
     "chromiumPackage": "https://archive.archlinux.org/packages/c/chromium/chromium-155.0.8059.84-1-x86_64.pkg.tar.zst",
