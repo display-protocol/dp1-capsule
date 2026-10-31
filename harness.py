@@ -37,8 +37,8 @@ def lo_up():
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
 
-def serve(root):
-    srv = socketserver.TCPServer(("127.0.0.1", 0), lambda *a, **k: Quiet(*a, directory=root, **k))
+def serve(root, port=0):
+    srv = socketserver.TCPServer(("127.0.0.1", port), lambda *a, **k: Quiet(*a, directory=root, **k))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
 
@@ -131,9 +131,9 @@ FRAME_CLOCK = """
   // and onto timers, which virtual time covers. The control surface below cannot be reached without the nonce.
   lock('requestAnimationFrame', (cb) => { const h = ++id; if (!frozen) q.push([h, cb]); return h; }, true);
   lock('cancelAnimationFrame', (h) => { cancelled.add(h); q = q.filter(([x]) => x !== h); }, true);
-  lock('__dp1c_tick', (nonce, last) => {
+  lock('__dp1c_tick', (nonce, last, t) => {
     if (nonce !== NONCE) throw new Error('dp1c: the frame clock is the engine\\'s');
-    const cur = q; q = []; const t = performance.now(); const errors = []; let fired = 0;
+    const cur = q; q = []; const errors = []; let fired = 0;
     for (const [h, cb] of cur) { if (cancelled.has(h)) continue; fired++; try { cb(t); } catch (e) { errors.push(String(e && e.stack || e)); } }
     cancelled.clear(); if (last) frozen = true;
     return JSON.stringify({fired, errors});
@@ -146,7 +146,7 @@ def main():
     out = cfg["out"]; os.makedirs(out, exist_ok=True)
     lo_up()   # needs CAP_NET_ADMIN; chromium itself is then started with every capability dropped (chromiumPrefix)
     cdp = CDP(cfg["chromium"], cfg["flags"], cfg.get("cwd") or "/tmp", cfg.get("chromiumPrefix", []))   # before any other fd is opened
-    srv, port = serve(cfg["work"])
+    srv, port = serve(cfg["work"], int(cfg.get("loopbackPort") or 0))   # the pin fixes the port, so the page sees the same origin every run
     replay = cfg.get("replay")
     table = replay_table(replay["resources"]) if replay else None
     url = replay["entry"] if replay else f"http://127.0.0.1:{port}/{urllib.parse.quote(cfg['entry'])}"
@@ -240,7 +240,8 @@ def main():
 }})();"""})
         if frames:
             # The frame clock is the engine's, not the compositor's: requestAnimationFrame callbacks run only when the
-            # harness ticks, once per frame, with performance.now() (virtual time) as their timestamp. After the last
+            # harness ticks, once per frame, with the frame's virtual time as their timestamp (computed here, not read from
+            # performance.now(), which carries sub-millisecond jitter under virtual time: 10983.3 vs 10983.4). After the last
             # tick the queue freezes, so the captured frame is frame N whatever the wall clock did. Without this the
             # number of animation frames before the screenshot varies run to run (observed on a frame-counted fade).
             S("Page.addScriptToEvaluateOnNewDocument", {"source": FRAME_CLOCK % json.dumps(nonce)})
@@ -256,9 +257,10 @@ def main():
             # one frame: run the queued animation callbacks in every document of the page (same-process frames), then
             # let virtual time move one interval, waiting on any fetch the frame started
             last = "true" if i == frames - 1 else "false"
+            t = round(float(cfg["virtualTimeBudgetMs"]) + i * interval, 3)   # frame i's DOMHighResTimeStamp: settle budget plus i intervals
             for cid in list(contexts):
                 try:
-                    r = S("Runtime.evaluate", {"expression": f"__dp1c_tick({json.dumps(nonce)}, {last})", "returnByValue": True, "contextId": cid})
+                    r = S("Runtime.evaluate", {"expression": f"__dp1c_tick({json.dumps(nonce)}, {last}, {t})", "returnByValue": True, "contextId": cid})
                 except RuntimeError as ex:
                     if "context" in str(ex).lower(): contexts.pop(cid, None); continue
                     raise

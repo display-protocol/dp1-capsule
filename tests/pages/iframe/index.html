@@ -1,0 +1,2 @@
+<body style="margin:0;background:#000;color:#fff;font:40px monospace"><div id=d>top 0</div><iframe id=f style="width:800px;height:200px;border:2px solid #0f0" srcdoc="<body style='margin:0;background:#003;color:#fff;font:40px monospace'><div id=d>frame 0</div><script>let n=0;function f(t){n++;document.getElementById('d').textContent='frame '+n;requestAnimationFrame(f)}requestAnimationFrame(f)</script>"></iframe><script>
+let n=0;function f(t){n++;document.getElementById('d').textContent='top '+n;requestAnimationFrame(f)}requestAnimationFrame(f)</script></body>

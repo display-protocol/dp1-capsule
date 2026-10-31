@@ -85,6 +85,7 @@ def engine_pin(version, viewport, budget_ms, image_ref, random_seed=None, frames
         "virtualEpochSeconds": VIRTUAL_EPOCH, "virtualTimeBudgetMs": budget_ms, "timezone": "UTC", "locale": "en-US",
         # the frame schedule: after the settle budget, exactly this many animation frames at this interval, then freeze
         "frames": frames, "frameIntervalMs": frame_interval_ms, "hardwareConcurrency": 4,
+        "loopbackPort": 8371,   # files layout: the origin the page sees; fixed so two builds record the same href (the network namespace is private)
         "randomSeed": random_seed,   # None: the work's own randomness is left alone (on-chain gen art seeds itself)
         "network": "none",
         "harnessSha256": sha256_file(HARNESS),
@@ -179,7 +180,7 @@ def render(root, assets_dir, entry, engine, outdir, replay=None):
         cfg = {"out": outdir, "work": os.path.abspath(assets_dir), "entry": entry, "chromium": "/usr/bin/chromium",
                "flags": engine["flags"], "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
                "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
-               "randomSeed": engine.get("randomSeed"), "frames": engine.get("frames"), "frameIntervalMs": engine.get("frameIntervalMs"), "hardwareConcurrency": engine.get("hardwareConcurrency"), "cwd": "/tmp", "chromiumPrefix": [], "replay": replay,
+               "randomSeed": engine.get("randomSeed"), "frames": engine.get("frames"), "frameIntervalMs": engine.get("frameIntervalMs"), "hardwareConcurrency": engine.get("hardwareConcurrency"), "loopbackPort": engine.get("loopbackPort"), "cwd": "/tmp", "chromiumPrefix": [], "replay": replay,
                "wallTimeoutSeconds": int(os.environ.get("DP1C_WALL_SECONDS", "900")), "debug": bool(os.environ.get("DP1C_DEBUG"))}
         env = dict(SANDBOX_ENV); os.makedirs("/tmp/xdg", exist_ok=True); os.makedirs("/tmp/xdgc", exist_ok=True); os.makedirs("/tmp/run", exist_ok=True); os.makedirs("/tmp/profile", exist_ok=True)
         r = subprocess.run([sys.executable, HARNESS], input=canon(cfg), capture_output=True, text=True, timeout=1800, env=env)
@@ -197,7 +198,7 @@ def render(root, assets_dir, entry, engine, outdir, replay=None):
     cfg = {"out": O, "work": W, "entry": entry, "chromium": chromium, "flags": engine["flags"],
            "viewport": engine["viewport"], "virtualEpochSeconds": engine["virtualEpochSeconds"],
            "virtualTimeBudgetMs": engine["virtualTimeBudgetMs"], "timezone": engine["timezone"], "locale": engine["locale"],
-           "randomSeed": engine.get("randomSeed"), "frames": engine.get("frames"), "frameIntervalMs": engine.get("frameIntervalMs"), "hardwareConcurrency": engine.get("hardwareConcurrency"), "cwd": "/tmp", "replay": replay,
+           "randomSeed": engine.get("randomSeed"), "frames": engine.get("frames"), "frameIntervalMs": engine.get("frameIntervalMs"), "hardwareConcurrency": engine.get("hardwareConcurrency"), "loopbackPort": engine.get("loopbackPort"), "cwd": "/tmp", "replay": replay,
            "wallTimeoutSeconds": int(os.environ.get("DP1C_WALL_SECONDS", "900")), "debug": bool(os.environ.get("DP1C_DEBUG")),
            # after loopback is up the harness launches chromium with every capability dropped
            "chromiumPrefix": ["/usr/bin/setpriv", "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs"] if (setpriv and os.path.exists(setpriv)) else []}
@@ -458,6 +459,8 @@ def write_capsule(a, stage, outdir, root, version, image_ref, engine, entry, ite
     open(os.path.join(stage, "meta", "render", "reference.json"), "w").write(canon(
         {"mode": "replay" if capture else "files", "entry": entry, "assets": asset_hashes, "renderedAt": now, "frame": fh,
          "page": rj["page"], "glRenderer": rj.get("glRenderer"), "problems": problems, "png": "meta/render/reference.png",
+         # what the frame clock did before the capture: ticks delivered, animation callbacks that ran, documents ticked
+         "frameClock": {"ticked": rj["diagnostics"].get("framesTicked"), "callbacks": rj["diagnostics"].get("rafCallbacks"), "contexts": rj["diagnostics"].get("frameContexts")},
          **({"capture": "meta/capture/resources.json"} if capture else {})}))
     shutil.copy(os.path.join(outdir, "shot.png"), os.path.join(stage, "meta", "render", "reference.png"))
     cid = pack(stage, a.out)

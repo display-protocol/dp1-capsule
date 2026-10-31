@@ -1,0 +1,4 @@
+<body style="margin:0;background:#000;color:#fff;font:40px monospace"><div id=d>no worker yet</div><script>
+const w = new Worker(URL.createObjectURL(new Blob(["let n=0; setInterval(()=>postMessage(++n), 50)"], {type:"text/javascript"})));
+w.onmessage = (e) => document.getElementById('d').textContent = 'worker tick ' + e.data;
+</script></body>
