@@ -146,21 +146,71 @@ sys.path.insert(0, ROOT)
 import dp1c
 
 D = dp1c.decide
-same = dict(bad=[], signer_ok=True, sigs=[], clean=True, engine_match=True, harness_match=True, pinned="sha", same_version=True)
-check("tolerance: exact render is reproduced", D(**same, distance=0, tolerance=4) == "reproduced")
-check("tolerance: a color shift (2 bits) is reproduced at the default", D(**same, distance=2, tolerance=4) == "reproduced")
-check("tolerance: a blank frame (11 bits) is reproMismatch at the default", D(**same, distance=11, tolerance=4) == "reproMismatch")
-check("tolerance: the artist's 0 makes one bit a mismatch", D(**same, distance=1, tolerance=0) == "reproMismatch")
-check(
-    "tolerance: within, on another engine, is reproducedOnDifferentEngine",
-    D(**{**same, "engine_match": False}, distance=3, tolerance=4) == "reproducedOnDifferentEngine",
-)
-check(
-    "tolerance: render problems outrank a matching frame",
-    D(**{**same, "clean": False}, distance=0, tolerance=4) == "renderProblems",
-)
-check("tolerance: an unsigned capsule with a required signer is unsigned", D(**{**same, "signer_ok": False}, distance=0, tolerance=4) == "unsigned")
-check("tolerance: a bad static check is assetsCorrupt", D(**{**same, "bad": ["x"]}, distance=0, tolerance=4) == "assetsCorrupt")
+check("tolerance: the documented default is 3", dp1c.DEFAULT_TOLERANCE == 3, str(dp1c.DEFAULT_TOLERANCE))
+T = dp1c.DEFAULT_TOLERANCE
+same = dict(bad=[], signer_ok=True, sigs=[], clean=True, covered=True, engine_match=True, harness_match=True, pinned="sha", same_version=True)
+check("tolerance: exact render is reproduced", D(**same, exact=True, distance=0, tolerance=T) == "reproduced")
+check("tolerance: a 2-bit shift is reproduced at the default", D(**same, exact=False, distance=2, tolerance=T) == "reproduced")
+check("tolerance: a 4-bit crop is reproMismatch at the default", D(**same, exact=False, distance=4, tolerance=T) == "reproMismatch")
+check("tolerance: an 11-bit blank is reproMismatch at the default", D(**same, exact=False, distance=11, tolerance=T) == "reproMismatch")
+check("tolerance: 0 is decided by the pixel hash: distance 0, not exact, is a mismatch", D(**same, exact=False, distance=0, tolerance=0) == "reproMismatch")
+check("tolerance: 0 with exact pixels is reproduced", D(**same, exact=True, distance=0, tolerance=0) == "reproduced")
+check("tolerance: a vanished drawing (coverage guard) is reproMismatch at distance 0", D(**{**same, "covered": False}, exact=False, distance=0, tolerance=T) == "reproMismatch")
+check("tolerance: within, on another engine, is reproducedOnDifferentEngine", D(**{**same, "engine_match": False}, exact=False, distance=3, tolerance=T) == "reproducedOnDifferentEngine")
+check("tolerance: render problems outrank a matching frame", D(**{**same, "clean": False}, exact=True, distance=0, tolerance=T) == "renderProblems")
+check("tolerance: an unsigned capsule with a required signer is unsigned", D(**{**same, "signer_ok": False}, exact=True, distance=0, tolerance=T) == "unsigned")
+check("tolerance: a bad static check is assetsCorrupt", D(**{**same, "bad": ["x"]}, exact=True, distance=0, tolerance=T) == "assetsCorrupt")
+from PIL import Image
+
+W, H = 1920, 1080
+white = Image.new("RGB", (W, H), (255, 255, 255))
+dot = white.copy()
+dot.paste((0, 0, 0), (900, 500, 920, 520))
+check("coverage: a 20x20 drawing on white is 2 bits from blank (the distance alone would pass it)",
+      bin(int(dp1c.dhash(dot), 16) ^ int(dp1c.dhash(white), 16)).count("1") <= T)
+check("coverage: the guard refuses the blank for that drawing", not dp1c.coverage_ok(dp1c.coverage(dot), dp1c.coverage(white)))
+check("coverage: a blank reference accepts a blank render", dp1c.coverage_ok(dp1c.coverage(white), dp1c.coverage(white)))
+r = run("build", os.path.join(ROOT, "tests", "pages", "raf"), "--host", "--out", os.path.join(out, "t65.dp1c"), "--created", CREATED, "--tolerance", "65", ok=False)
+check("tolerance: build refuses 65", r.returncode != 0 and "0..64" in (r.stdout + r.stderr))
+
+# an older capsule with no repro.tolerance verifies at the default
+ref, data = reference(clean)
+t = tarfile.open(fileobj=io.BytesIO(data))
+buf = io.BytesIO()
+w = tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT)
+for m in t.getmembers():
+    body = t.extractfile(m).read() if m.isreg() else None
+    if m.name == "playlist.json":
+        pl = json.loads(body)
+        del pl["items"][0]["repro"]["tolerance"]
+        body = json.dumps(pl, sort_keys=True, separators=(",", ":")).encode()
+        m.size = len(body)
+    w.addfile(m, io.BytesIO(body) if body is not None else None)
+w.close()
+legacy = os.path.join(out, "raf-legacy.dp1c")
+open(legacy, "wb").write(zstandard.ZstdCompressor(level=19).compress(buf.getvalue()))
+r = run("verify", legacy, "--host", ok=False)
+v = json.loads(r.stdout)
+check("tolerance: a capsule without the field verifies at the default", v.get("tolerance") == T and v.get("verdict") == "reproducedUnpinned", f"{v.get('tolerance')} {v.get('verdict')}")
+
+# recorded build problems keep a capsule at renderProblems even when the render is clean and exact
+t = tarfile.open(fileobj=io.BytesIO(data))
+buf = io.BytesIO()
+w = tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT)
+for m in t.getmembers():
+    body = t.extractfile(m).read() if m.isreg() else None
+    if m.name == "meta/render/reference.json":
+        rj = json.loads(body)
+        rj["problems"]["exceptions"] = ["recorded at build"]
+        body = json.dumps(rj, sort_keys=True, separators=(",", ":")).encode()
+        m.size = len(body)
+    w.addfile(m, io.BytesIO(body) if body is not None else None)
+w.close()
+recorded = os.path.join(out, "raf-recorded.dp1c")
+open(recorded, "wb").write(zstandard.ZstdCompressor(level=19).compress(buf.getvalue()))
+r = run("verify", recorded, "--host", ok=False)
+v = json.loads(r.stdout)
+check("recorded problems: a capsule built with problems is renderProblems on a clean render", v.get("verdict") == "renderProblems" and r.returncode == 2, f"{v.get('verdict')}")
 
 # web3:// URL parsing (ERC-4804 auto mode), offline
 import importlib.util

@@ -33,10 +33,11 @@ HARNESS = os.path.join(HERE, "harness.py")
 CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
 ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
 # dHash distance within which a render is the work when the playlist declares no tolerance. Readings on the five
-# examples (2026-11-06): a few changed pixels, a color shift, JPEG at quality 60, a 1.5 px blur or a 2 px shift cost
-# 0..2 bits; a 5% crop costs 4..10; a blank frame costs 11..34; another work costs 13..38. 4 separates the first
-# group from the rest on every example with margin on both sides. The artist's own number, declared at build, wins.
-DEFAULT_TOLERANCE = 4
+# examples (2026-11-06): a few changed pixels, a gamma or saturation shift, JPEG at quality 60, a 1.5 px blur or a 2 px
+# shift cost 0..2 bits; a 5% crop costs 4..10; a blank frame costs 11..34 on these frames, but that floor is theirs, not
+# a bound: a small drawing on a plain ground is 2 bits from its own blank. 3 sits between the degradations and the
+# crops; the blank case is caught by the coverage guard (coverage_ok), not by the distance. The artist's number wins.
+DEFAULT_TOLERANCE = 3
 MAX_CAPSULE_BYTES = 2 * 1024**3
 MAX_MEMBERS = 50000
 MAX_BODY = 200 * 1024 * 1024  # largest response body a replay capsule may carry (one DevTools message each)
@@ -495,13 +496,36 @@ def dhash(im, size=8):
     return "0x" + int(bits, 2).to_bytes(size * size // 8, "big").hex()
 
 
+def coverage(im):
+    """Fraction of pixels more than 8 gray levels from the frame's modal gray: how much of the frame is drawn on.
+    A blank frame is 0. Relative to each frame's own mode, so a global shift of the ground does not move it."""
+    g = im.convert("L")
+    hist = g.histogram()
+    mode = max(range(256), key=lambda v: hist[v])
+    lo, hi = max(0, mode - 8), min(255, mode + 8)
+    near = sum(hist[lo : hi + 1])
+    return round(1 - near / (g.width * g.height), 6)
+
+
+def coverage_ok(expected, here):
+    """The render has at least half the reference's drawing, or, for a blank reference, is itself blank (≤ 1%)."""
+    return here >= expected / 2 if expected > 0 else here <= 0.01
+
+
 def frame_hash(png_bytes, viewport):
     im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     if im.size != (viewport["width"], viewport["height"]):
         sys.exit(f"captured frame is {im.size}, pin says {viewport['width']}x{viewport['height']}")
     h = hashlib.sha256(f"{im.width}x{im.height}:RGB8:".encode())
     h.update(im.tobytes())
-    return {"sha256": h.hexdigest(), "phash": dhash(im), "width": im.width, "height": im.height, "format": "RGB8"}
+    return {
+        "sha256": h.hexdigest(),
+        "phash": dhash(im),
+        "coverage": coverage(im),
+        "width": im.width,
+        "height": im.height,
+        "format": "RGB8",
+    }
 
 
 # ---------- archive ---------------------------------------------------------
@@ -981,22 +1005,30 @@ def cmd_import_capture(a):
         write_capsule(a, stage, outdir, root, version, image_ref, engine, rec["entry"], item_base, source, capture)
 
 
-def decide(bad, signer_ok, sigs, clean, distance, tolerance, engine_match, harness_match, pinned, same_version):
-    """The verdict, in the order the checks are decided. distance is the dHash distance between the render and the
-    reference; tolerance is the capsule's declared number (0 = exact pixels). Only 'reproduced' exits 0."""
+def decide(bad, signer_ok, sigs, clean, exact, distance, tolerance, covered, engine_match, harness_match, pinned, same_version):
+    """The verdict, in the order the checks are decided. exact is the pixel hash match; distance is the dHash distance
+    between the render and the reference; tolerance is the capsule's declared number (0 = exact pixels, decided by the
+    pixel hash, never by the distance); covered is the coverage guard (coverage_ok), which catches a drawing that
+    vanished from a plain ground at a distance the hash does not see. clean covers both the render just made and the
+    problems the build recorded. Only 'reproduced' exits 0."""
     if bad:
         return "assetsCorrupt"
     if not signer_ok:
         return "unsigned" if not sigs else "signatureInvalid"
     if not clean:
         return "renderProblems"
-    if distance > tolerance:
+    within = exact if tolerance == 0 else (distance <= tolerance and covered)
+    if not within:
         return "reproMismatch"
     if engine_match and harness_match:
         return "reproduced"
     if not pinned and harness_match and same_version:
         return "reproducedUnpinned"  # the capsule names no image (built with --host): same Chromium version and harness, but nothing pinned
     return "reproducedOnDifferentEngine"
+
+
+def within_tolerance(exact, distance, tolerance, covered):
+    return exact if tolerance == 0 else (distance <= tolerance and covered)
 
 
 def cmd_verify(a):
@@ -1048,6 +1080,10 @@ def cmd_verify(a):
                         "capsuleId": sha256_file(a.capsule),
                         "assetsIntact": False,
                         "assetProblems": bad,
+                        "exact": None,
+                        "phashDistance": None,
+                        "tolerance": tolerance,
+                        "withinTolerance": None,
                         "verdict": "assetsCorrupt",
                     },
                     indent=2,
@@ -1097,13 +1133,16 @@ def cmd_verify(a):
         # a render that failed to load something, threw, left requests in flight, ran code outside the engine's clock, or
         # (replay) did not come from the capture is not a reproduction, even if the pixels match. A capsule built with
         # --allow-render-errors carries its problems and is reported the same way: an acknowledged partial, never exit 0.
-        clean = not any(problems.values())
+        recorded = ref.get("problems") or {}
+        clean = not any(problems.values()) and not any(recorded.values())
+        covered = coverage_ok(ref_png["coverage"], fh["coverage"])
         sigs = check_signatures(a.capsule, a.sig)
         signer_ok = True
         if a.require_signer:
             signer_ok = any(x["valid"] and x["kid"] == a.require_signer for x in sigs)
         verdict = decide(
-            bad, signer_ok, sigs, clean, ham, tolerance, engine_match, harness_match, pinned_img, here_ver == engine["version"]
+            bad, signer_ok, sigs, clean, exact, ham, tolerance, covered,
+            engine_match, harness_match, pinned_img, here_ver == engine["version"],
         )
         print(
             json.dumps(
@@ -1124,7 +1163,11 @@ def cmd_verify(a):
                     "exact": exact,
                     "phashDistance": ham,
                     "tolerance": tolerance,
-                    "withinTolerance": ham <= tolerance,
+                    "withinTolerance": within_tolerance(exact, ham, tolerance, covered),
+                    "coverageExpected": ref_png["coverage"],
+                    "coverageHere": fh["coverage"],
+                    "coverageOk": covered,
+                    "renderProblemsRecorded": recorded,
                     "renderProblems": problems,
                     "replayed": rj["diagnostics"].get("replayed"),
                     "framesTicked": rj["diagnostics"].get("framesTicked"),
@@ -1157,6 +1200,13 @@ def cmd_info(a):
                 )
 
 
+def tolerance_arg(v):
+    n = int(v)
+    if not 0 <= n <= 64:
+        raise argparse.ArgumentTypeError("tolerance is a dHash distance, an integer 0..64")
+    return n
+
+
 def main():
     p = argparse.ArgumentParser(prog="dp1c")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -1180,7 +1230,7 @@ def main():
         x.add_argument("--allow-render-errors", action="store_true")
         x.add_argument(
             "--tolerance",
-            type=int,
+            type=tolerance_arg,
             default=DEFAULT_TOLERANCE,
             metavar="N",
             help=f"dHash distance within which a render is still the work; 0 means exact pixels (default {DEFAULT_TOLERANCE}); the artist's number",
