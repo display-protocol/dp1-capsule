@@ -1102,7 +1102,7 @@ def cmd_verify(a):
             root = "CONTAINER"
         elif a.engine:
             root, here_img, _ = engine_open(a.engine)
-        elif pinned_img and _cache_root(pinned_img):
+        elif pinned_img and _cache_root(pinned_img) and not a.host:
             root, here_img = _cache_root(pinned_img), pinned_img
         elif not a.host:
             sys.exit(
@@ -1181,6 +1181,122 @@ def cmd_verify(a):
             )
         )
         sys.exit(0 if verdict == "reproduced" else 2)
+
+
+def cmd_sheet(a):
+    """The contact sheet: the reference frame beside renders of the same capsule on whatever engines are reachable, plus
+    any frames handed in as files (an FF1's own capture), plus one deliberate probe (the reference with its brightness
+    raised), each tile captioned with its row/column dHash distances and whether it is within the declared tolerance.
+    The artist marks tiles as the work or not; the number is the largest accepted distance under the smallest rejected
+    one, and a rejected tile at distance 0 or 1 says the hash does not see what they care about. Writes the PNG and a
+    JSON beside it with the same numbers, the input to a later mark-and-sign step."""
+    from PIL import ImageDraw, ImageEnhance, ImageFont
+
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outdir:
+        unpack(a.capsule, d)
+        pl = json.load(open(os.path.join(d, "playlist.json")))
+        engine = json.load(open(os.path.join(d, "meta", "engine", "chromium.json")))
+        ref = json.load(open(os.path.join(d, "meta", "render", "reference.json")))
+        item = pl["items"][0]
+        tolerance = item["repro"].get("tolerance", DEFAULT_TOLERANCE)
+        ref_bytes = open(os.path.join(d, "meta", "render", "reference.png"), "rb").read()
+        ref_fh = frame_hash(ref_bytes, engine["viewport"])
+        ref_im = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
+        assets = os.path.join(d, "assets")
+        replay = None
+        if ref.get("mode") == "replay":
+            capture = json.load(open(os.path.join(d, "meta", "capture", "resources.json")))
+            replay = {"entry": capture["entry"], "resources": capture["resources"]}
+        run_engine = {**engine, "flags": list(DETERMINISTIC_FLAGS), "env": dict(SANDBOX_ENV)}
+        tiles = [("reference, as recorded", ref_im, "capsule")]
+        pinned_img = (engine.get("imageRef") or {}).get("sha256")
+        root = None
+        if a.engine:
+            root, here_img, _ = engine_open(a.engine)
+        elif pinned_img and _cache_root(pinned_img):
+            root, here_img = _cache_root(pinned_img), pinned_img
+        if root:
+            o = os.path.join(outdir, "pinned")
+            os.makedirs(o)
+            png, rj = render(root, assets, ref["entry"], run_engine, o, replay)
+            same = here_img == pinned_img
+            tiles.append(
+                (
+                    f"pinned engine image, Chromium {engine_version(root)}, software raster" + ("" if same else " (not the capsule's image)"),
+                    Image.open(io.BytesIO(png)).convert("RGB"),
+                    "render",
+                )
+            )
+        if a.host:
+            o = os.path.join(outdir, "host")
+            os.makedirs(o)
+            png, rj = render(None, assets, ref["entry"], run_engine, o, replay)
+            tiles.append((f"this machine, Chromium {host_version()}, software raster", Image.open(io.BytesIO(png)).convert("RGB"), "render"))
+        for spec in a.tile or []:
+            label, _, path = spec.partition("=")
+            if not path:
+                sys.exit(f"--tile wants LABEL=PATH, got {spec!r}")
+            tiles.append((label, Image.open(path).convert("RGB"), "file"))
+        if not a.no_probe:
+            tiles.append(("probe: the reference with brightness x1.1 (is color part of the work?)", ImageEnhance.Brightness(ref_im).enhance(1.1), "probe"))
+        rows = []
+        for label, im, kind in tiles:
+            note = ""
+            if im.size != ref_im.size:
+                note = f" (resized from {im.width}x{im.height})"
+                im = im.resize(ref_im.size, Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            fh = frame_hash(buf.getvalue(), engine["viewport"])
+            dh, dv = hamming(fh["phash"], ref_fh["phash"]), hamming(fh["phashV"], ref_fh["phashV"])
+            exact = fh["sha256"] == ref_fh["sha256"]
+            rows.append(
+                {
+                    "label": label + note,
+                    "kind": kind,
+                    "exact": exact,
+                    "rows": dh,
+                    "columns": dv,
+                    "withinTolerance": within_tolerance(exact, max(dh, dv), tolerance),
+                    "sha256": fh["sha256"],
+                    "image": im,
+                }
+            )
+        # layout: two tiles per row, a caption under each, a title line on top
+        tw = a.tile_width
+        th = round(ref_im.height * tw / ref_im.width)
+        cap_h, pad, cols = 64, 16, 2
+        n = len(rows)
+        nrows = (n + cols - 1) // cols
+        W = cols * tw + (cols + 1) * pad
+        H = 56 + nrows * (th + cap_h + pad) + pad
+        sheet = Image.new("RGB", (W, H), (245, 245, 245))
+        draw = ImageDraw.Draw(sheet)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/liberation/LiberationSans-Regular.ttf", 18)
+            small = ImageFont.truetype("/usr/share/fonts/liberation/LiberationSans-Regular.ttf", 15)
+        except OSError:
+            font = small = ImageFont.load_default()
+        title = item.get("title") or pl.get("title") or "untitled"
+        draw.text((pad, pad), f"{title}   capsule {sha256_file(a.capsule)[:12]}   declared tolerance {tolerance} (0 = exact pixels)", fill=(20, 20, 20), font=font)
+        for i, r in enumerate(rows):
+            x = pad + (i % cols) * (tw + pad)
+            y = 56 + (i // cols) * (th + cap_h + pad)
+            sheet.paste(r["image"].resize((tw, th), Image.LANCZOS), (x, y))
+            verdict = "exact" if r["exact"] else (f"within {tolerance}" if r["withinTolerance"] else f"over {tolerance}")
+            draw.text((x, y + th + 6), r["label"], fill=(20, 20, 20), font=small)
+            draw.text((x, y + th + 28), f"rows {r['rows']}  columns {r['columns']}  {verdict}", fill=(20, 20, 20) if r["withinTolerance"] else (160, 20, 20), font=small)
+        sheet.save(a.out, "PNG")
+        record = {
+            "capsuleId": sha256_file(a.capsule),
+            "title": title,
+            "tolerance": tolerance,
+            "reference": {"sha256": ref_fh["sha256"], "phash": ref_fh["phash"], "phashV": ref_fh["phashV"]},
+            "tiles": [{k: v for k, v in r.items() if k != "image"} for r in rows],
+            "marks": {},
+        }
+        open(a.out + ".json", "w").write(json.dumps(record, indent=2))
+        print(json.dumps({k: v for k, v in record.items() if k != "reference"}, indent=2))
 
 
 def cmd_info(a):
@@ -1283,6 +1399,15 @@ def main():
     i = sp.add_parser("info")
     i.add_argument("capsule")
     i.set_defaults(f=cmd_info)
+    h = sp.add_parser("sheet", help="contact sheet: the reference beside renders on reachable engines, files, and a probe")
+    h.add_argument("capsule")
+    h.add_argument("--out", required=True, help="PNG; a JSON with the same numbers is written beside it")
+    h.add_argument("--engine", help="render inside this engine image (default: the capsule's, if cached)")
+    h.add_argument("--host", action="store_true", help="also render with this machine's chromium, software raster")
+    h.add_argument("--tile", action="append", metavar="LABEL=PATH", help="a frame from elsewhere (an FF1's own capture); repeatable")
+    h.add_argument("--no-probe", action="store_true", help="leave out the brightness probe")
+    h.add_argument("--tile-width", type=int, default=720)
+    h.set_defaults(f=cmd_sheet)
     a = p.parse_args()
     a.f(a)
 

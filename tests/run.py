@@ -210,6 +210,17 @@ r = run("verify", recorded, "--host", ok=False)
 v = json.loads(r.stdout)
 check("recorded problems: a capsule built with problems is renderProblems on a clean render", v.get("verdict") == "renderProblems" and r.returncode == 2, f"{v.get('verdict')}")
 
+# the contact sheet from a host-built capsule: reference and host render exact, the probe not, numbers in the JSON
+sheet_png = os.path.join(out, "sheet.png")
+run("sheet", clean, "--host", "--out", sheet_png)
+sj = json.load(open(sheet_png + ".json"))
+kinds = {t["kind"]: t for t in sj["tiles"]}
+check("sheet: PNG written", os.path.getsize(sheet_png) > 1000)
+check("sheet: reference tile is exact", kinds["capsule"]["exact"] is True)
+check("sheet: host render tile is exact on the machine that built it", kinds["render"]["exact"] is True, str(kinds["render"]))
+check("sheet: the probe is not exact and its distances are reported", kinds["probe"]["exact"] is False and "rows" in kinds["probe"], str(kinds["probe"]))
+check("sheet: tolerance carried", sj["tolerance"] == T)
+
 # web3:// URL parsing (ERC-4804 auto mode), offline
 import importlib.util
 

@@ -96,6 +96,12 @@ Not yet real, in order of how much they matter:
 5. **On the device.** The capture is the device's and the import is a laptop command. Capture-to-capsule and the verify loop inside feral-controld are specified in `SPEC-PROPOSAL.md` ("How this fits the device") and not built.
 6. **Which frame.** Frame 60 is a default, not the artist's statement; CSS animations and video run on compositor time and are not yet under the frame clock. Decision 4. Tolerance is decided (decision 5); the artist's sign-off signature is specified in decision 1 and not built.
 
+## The contact sheet
+
+`sheet` is how an artist arrives at a tolerance without picking a number. It lays the recorded reference frame beside the same capsule rendered again in the pinned engine, rendered in this machine's own Chromium (`--host`), any frames handed in as files (`--tile "FF1 Kitchen, GPU=shot.png"`, the device's own capture), and one deliberate probe, the reference with its brightness raised a tenth. Every tile carries its row and column dHash distance from the reference and whether it is within the declared tolerance. The artist marks each tile as the work or not; the number is the largest accepted distance under the smallest rejected one, and a rejected tile at distance 0 or 1 means the hash does not see what they care about and that work needs a second measure. A JSON beside the PNG carries the same numbers and an empty `marks` object, the input to the mark-and-sign step, which is not built: the artist's signature over the capsule id (decision 1) with the wallet as the key. Measured: the sheet of a host-built capsule on the machine that built it shows the reference and the host render exact and the probe at 0/0, within tolerance, which is the probe doing its job: a brightness change the hash cannot see is the artist's to accept or reject.
+
+`verify --host` runs this machine's Chromium even when the capsule's engine image is cached; the pinned image is used only without `--host` or with `--engine`.
+
 ## Why this and not a screenshot
 
 A screenshot proves what the publisher saw. A capsule lets the owner re-derive it, inside the same engine, with nothing else reachable. The difference is what has to be trusted: the file and the image, not the publisher.
