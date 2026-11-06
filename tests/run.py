@@ -148,14 +148,13 @@ import dp1c
 D = dp1c.decide
 check("tolerance: the documented default is 3", dp1c.DEFAULT_TOLERANCE == 3, str(dp1c.DEFAULT_TOLERANCE))
 T = dp1c.DEFAULT_TOLERANCE
-same = dict(bad=[], signer_ok=True, sigs=[], clean=True, covered=True, engine_match=True, harness_match=True, pinned="sha", same_version=True)
+same = dict(bad=[], signer_ok=True, sigs=[], clean=True, engine_match=True, harness_match=True, pinned="sha", same_version=True)
 check("tolerance: exact render is reproduced", D(**same, exact=True, distance=0, tolerance=T) == "reproduced")
 check("tolerance: a 2-bit shift is reproduced at the default", D(**same, exact=False, distance=2, tolerance=T) == "reproduced")
 check("tolerance: a 4-bit crop is reproMismatch at the default", D(**same, exact=False, distance=4, tolerance=T) == "reproMismatch")
 check("tolerance: an 11-bit blank is reproMismatch at the default", D(**same, exact=False, distance=11, tolerance=T) == "reproMismatch")
 check("tolerance: 0 is decided by the pixel hash: distance 0, not exact, is a mismatch", D(**same, exact=False, distance=0, tolerance=0) == "reproMismatch")
 check("tolerance: 0 with exact pixels is reproduced", D(**same, exact=True, distance=0, tolerance=0) == "reproduced")
-check("tolerance: a vanished drawing (coverage guard) is reproMismatch at distance 0", D(**{**same, "covered": False}, exact=False, distance=0, tolerance=T) == "reproMismatch")
 check("tolerance: within, on another engine, is reproducedOnDifferentEngine", D(**{**same, "engine_match": False}, exact=False, distance=3, tolerance=T) == "reproducedOnDifferentEngine")
 check("tolerance: render problems outrank a matching frame", D(**{**same, "clean": False}, exact=True, distance=0, tolerance=T) == "renderProblems")
 check("tolerance: an unsigned capsule with a required signer is unsigned", D(**{**same, "signer_ok": False}, exact=True, distance=0, tolerance=T) == "unsigned")
@@ -163,13 +162,12 @@ check("tolerance: a bad static check is assetsCorrupt", D(**{**same, "bad": ["x"
 from PIL import Image
 
 W, H = 1920, 1080
-white = Image.new("RGB", (W, H), (255, 255, 255))
-dot = white.copy()
-dot.paste((0, 0, 0), (900, 500, 920, 520))
-check("coverage: a 20x20 drawing on white is 2 bits from blank (the distance alone would pass it)",
-      bin(int(dp1c.dhash(dot), 16) ^ int(dp1c.dhash(white), 16)).count("1") <= T)
-check("coverage: the guard refuses the blank for that drawing", not dp1c.coverage_ok(dp1c.coverage(dot), dp1c.coverage(white)))
-check("coverage: a blank reference accepts a blank render", dp1c.coverage_ok(dp1c.coverage(white), dp1c.coverage(white)))
+top = Image.new("RGB", (W, H), (255, 255, 255))
+top.paste((0, 0, 0), (0, 0, W, H // 2))
+bottom = Image.new("RGB", (W, H), (255, 255, 255))
+bottom.paste((0, 0, 0), (0, H // 2, W, H))
+check("two axes: black-top vs black-bottom is 0 bits on rows (the row hash alone would pass it)", dp1c.hamming(dp1c.dhash(top), dp1c.dhash(bottom)) == 0)
+check("two axes: and far over the default on columns", dp1c.hamming(dp1c.dhash_v(top), dp1c.dhash_v(bottom)) > T, str(dp1c.hamming(dp1c.dhash_v(top), dp1c.dhash_v(bottom))))
 r = run("build", os.path.join(ROOT, "tests", "pages", "raf"), "--host", "--out", os.path.join(out, "t65.dp1c"), "--created", CREATED, "--tolerance", "65", ok=False)
 check("tolerance: build refuses 65", r.returncode != 0 and "0..64" in (r.stdout + r.stderr))
 

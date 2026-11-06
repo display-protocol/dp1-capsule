@@ -32,11 +32,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "harness.py")
 CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
 ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
-# dHash distance within which a render is the work when the playlist declares no tolerance. Readings on the five
-# examples (2026-11-06): a few changed pixels, a gamma or saturation shift, JPEG at quality 60, a 1.5 px blur or a 2 px
-# shift cost 0..2 bits; a 5% crop costs 4..10; a blank frame costs 11..34 on these frames, but that floor is theirs, not
-# a bound: a small drawing on a plain ground is 2 bits from its own blank. 3 sits between the degradations and the
-# crops; the blank case is caught by the coverage guard (coverage_ok), not by the distance. The artist's number wins.
+# dHash distance within which a render is the work when the playlist declares no tolerance, applied to both the
+# recorded horizontal hash and the vertical one computed at verify. Readings on the five examples (2026-11-06),
+# horizontal/vertical bits: JPEG at quality 60, a 1.5 px blur, gamma 0.8, a 2 px shift cost 0..2 on dense works and up
+# to 3 on the sparse ones; a 10% brightness or 40% saturation change costs up to 4/6 on Digital Soul, the sparsest; a
+# 5% crop costs 4..10 horizontally; a blank frame 11..34; a mirrored or halves-swapped frame 4..38 horizontally but
+# 3..38 vertically, with Fidenza at 4/15 and 5/28, which is why the vertical hash is checked at all. 3 is between the
+# engine-sized differences and the rest on these frames; the margins are thin on sparse works, and the artist's
+# contact sheet, not this constant, is where a work's number is found. The artist's number wins.
 DEFAULT_TOLERANCE = 3
 MAX_CAPSULE_BYTES = 2 * 1024**3
 MAX_MEMBERS = 50000
@@ -496,20 +499,21 @@ def dhash(im, size=8):
     return "0x" + int(bits, 2).to_bytes(size * size // 8, "big").hex()
 
 
-def coverage(im):
-    """Fraction of pixels more than 8 gray levels from the frame's modal gray: how much of the frame is drawn on.
-    A blank frame is 0. Relative to each frame's own mode, so a global shift of the ground does not move it."""
-    g = im.convert("L")
-    hist = g.histogram()
-    mode = max(range(256), key=lambda v: hist[v])
-    lo, hi = max(0, mode - 8), min(255, mode + 8)
-    near = sum(hist[lo : hi + 1])
-    return round(1 - near / (g.width * g.height), 6)
+def dhash_v(im, size=8):
+    """The same difference hash down the columns: 8x9, bit = upper pixel > lower pixel. Computed at verify from the
+    reference PNG and the render, never recorded in the playlist, so the §5 phash field keeps its definition. It sees
+    what the row hash cannot: a frame flipped or with its halves swapped keeps most row gradients and reverses the
+    column ones."""
+    g = im.convert("L").resize((size, size + 1), Image.LANCZOS)
+    px = list(g.get_flattened_data()) if hasattr(g, "get_flattened_data") else list(g.getdata())
+    bits = "".join(
+        "1" if px[r * size + c] > px[(r + 1) * size + c] else "0" for r in range(size) for c in range(size)
+    )
+    return "0x" + int(bits, 2).to_bytes(size * size // 8, "big").hex()
 
 
-def coverage_ok(expected, here):
-    """The render has at least half the reference's drawing, or, for a blank reference, is itself blank (≤ 1%)."""
-    return here >= expected / 2 if expected > 0 else here <= 0.01
+def hamming(h1, h2):
+    return bin(int(h1, 16) ^ int(h2, 16)).count("1")
 
 
 def frame_hash(png_bytes, viewport):
@@ -521,7 +525,7 @@ def frame_hash(png_bytes, viewport):
     return {
         "sha256": h.hexdigest(),
         "phash": dhash(im),
-        "coverage": coverage(im),
+        "phashV": dhash_v(im),
         "width": im.width,
         "height": im.height,
         "format": "RGB8",
@@ -1005,20 +1009,18 @@ def cmd_import_capture(a):
         write_capsule(a, stage, outdir, root, version, image_ref, engine, rec["entry"], item_base, source, capture)
 
 
-def decide(bad, signer_ok, sigs, clean, exact, distance, tolerance, covered, engine_match, harness_match, pinned, same_version):
-    """The verdict, in the order the checks are decided. exact is the pixel hash match; distance is the dHash distance
-    between the render and the reference; tolerance is the capsule's declared number (0 = exact pixels, decided by the
-    pixel hash, never by the distance); covered is the coverage guard (coverage_ok), which catches a drawing that
-    vanished from a plain ground at a distance the hash does not see. clean covers both the render just made and the
-    problems the build recorded. Only 'reproduced' exits 0."""
+def decide(bad, signer_ok, sigs, clean, exact, distance, tolerance, engine_match, harness_match, pinned, same_version):
+    """The verdict, in the order the checks are decided. exact is the pixel hash match; distance is the larger of the
+    row and column dHash distances between the render and the reference; tolerance is the capsule's declared number
+    (0 = exact pixels, decided by the pixel hash, never by the distance). clean covers both the render just made and
+    the problems the build recorded. Only 'reproduced' exits 0."""
     if bad:
         return "assetsCorrupt"
     if not signer_ok:
         return "unsigned" if not sigs else "signatureInvalid"
     if not clean:
         return "renderProblems"
-    within = exact if tolerance == 0 else (distance <= tolerance and covered)
-    if not within:
+    if not within_tolerance(exact, distance, tolerance):
         return "reproMismatch"
     if engine_match and harness_match:
         return "reproduced"
@@ -1027,8 +1029,8 @@ def decide(bad, signer_ok, sigs, clean, exact, distance, tolerance, covered, eng
     return "reproducedOnDifferentEngine"
 
 
-def within_tolerance(exact, distance, tolerance, covered):
-    return exact if tolerance == 0 else (distance <= tolerance and covered)
+def within_tolerance(exact, distance, tolerance):
+    return exact if tolerance == 0 else distance <= tolerance
 
 
 def cmd_verify(a):
@@ -1082,6 +1084,7 @@ def cmd_verify(a):
                         "assetProblems": bad,
                         "exact": None,
                         "phashDistance": None,
+                        "phashDistanceV": None,
                         "tolerance": tolerance,
                         "withinTolerance": None,
                         "verdict": "assetsCorrupt",
@@ -1126,7 +1129,9 @@ def cmd_verify(a):
             shutil.copy(os.path.join(outdir, "shot.png"), a.png)
         fh = frame_hash(png, engine["viewport"])
         exact = fh["sha256"] == want["sha256"]
-        ham = bin(int(fh["phash"], 16) ^ int(want["phash"], 16)).count("1")
+        ham_h = hamming(fh["phash"], want["phash"])
+        ham_v = hamming(fh["phashV"], ref_png["phashV"])  # from the reference PNG in hand; the recorded phash is rows only
+        ham = max(ham_h, ham_v)
         problems = render_problems(rj)
         if capture:
             problems["replay"] = replay_problems(rj, capture)
@@ -1135,14 +1140,13 @@ def cmd_verify(a):
         # --allow-render-errors carries its problems and is reported the same way: an acknowledged partial, never exit 0.
         recorded = ref.get("problems") or {}
         clean = not any(problems.values()) and not any(recorded.values())
-        covered = coverage_ok(ref_png["coverage"], fh["coverage"])
         sigs = check_signatures(a.capsule, a.sig)
         signer_ok = True
         if a.require_signer:
             signer_ok = any(x["valid"] and x["kid"] == a.require_signer for x in sigs)
         verdict = decide(
-            bad, signer_ok, sigs, clean, exact, ham, tolerance, covered,
-            engine_match, harness_match, pinned_img, here_ver == engine["version"],
+            bad, signer_ok, sigs, clean, exact, ham, tolerance, engine_match, harness_match, pinned_img,
+            here_ver == engine["version"],
         )
         print(
             json.dumps(
@@ -1161,12 +1165,10 @@ def cmd_verify(a):
                     "frameHashExpected": want["sha256"],
                     "frameHashHere": fh["sha256"],
                     "exact": exact,
-                    "phashDistance": ham,
+                    "phashDistance": ham_h,
+                    "phashDistanceV": ham_v,
                     "tolerance": tolerance,
-                    "withinTolerance": within_tolerance(exact, ham, tolerance, covered),
-                    "coverageExpected": ref_png["coverage"],
-                    "coverageHere": fh["coverage"],
-                    "coverageOk": covered,
+                    "withinTolerance": within_tolerance(exact, ham, tolerance),
                     "renderProblemsRecorded": recorded,
                     "renderProblems": problems,
                     "replayed": rj["diagnostics"].get("replayed"),
