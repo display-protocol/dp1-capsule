@@ -43,6 +43,13 @@ def reference(capsule):
     return json.load(t.extractfile("meta/render/reference.json")), data
 
 
+def dp1c_tolerance_default():
+    sys.path.insert(0, ROOT)
+    import dp1c
+
+    return dp1c.DEFAULT_TOLERANCE
+
+
 def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + (f"  ({detail})" if detail else ""))
     if not cond:
@@ -129,9 +136,31 @@ r = run("verify", clean, "--host", ok=False)
 v = json.loads(r.stdout)
 check(
     "clean: host verify of a host build is reproducedUnpinned, exit 2",
-    v.get("exact") is True and v.get("verdict") == "reproducedUnpinned" and r.returncode == 2,
+    v.get("exact") is True and v.get("withinTolerance") is True and v.get("tolerance") == dp1c_tolerance_default()
+    and v.get("verdict") == "reproducedUnpinned" and r.returncode == 2,
     f"verdict {v.get('verdict')}, exit {r.returncode}",
 )
+
+# the verdict against the declared tolerance, offline, with the distances measured on the examples (dp1c.DEFAULT_TOLERANCE)
+sys.path.insert(0, ROOT)
+import dp1c
+
+D = dp1c.decide
+same = dict(bad=[], signer_ok=True, sigs=[], clean=True, engine_match=True, harness_match=True, pinned="sha", same_version=True)
+check("tolerance: exact render is reproduced", D(**same, distance=0, tolerance=4) == "reproduced")
+check("tolerance: a color shift (2 bits) is reproduced at the default", D(**same, distance=2, tolerance=4) == "reproduced")
+check("tolerance: a blank frame (11 bits) is reproMismatch at the default", D(**same, distance=11, tolerance=4) == "reproMismatch")
+check("tolerance: the artist's 0 makes one bit a mismatch", D(**same, distance=1, tolerance=0) == "reproMismatch")
+check(
+    "tolerance: within, on another engine, is reproducedOnDifferentEngine",
+    D(**{**same, "engine_match": False}, distance=3, tolerance=4) == "reproducedOnDifferentEngine",
+)
+check(
+    "tolerance: render problems outrank a matching frame",
+    D(**{**same, "clean": False}, distance=0, tolerance=4) == "renderProblems",
+)
+check("tolerance: an unsigned capsule with a required signer is unsigned", D(**{**same, "signer_ok": False}, distance=0, tolerance=4) == "unsigned")
+check("tolerance: a bad static check is assetsCorrupt", D(**{**same, "bad": ["x"]}, distance=0, tolerance=4) == "assetsCorrupt")
 
 # web3:// URL parsing (ERC-4804 auto mode), offline
 import importlib.util

@@ -6,13 +6,13 @@ Reviewed read-only by Codex (gpt-6-astra) and Grok on 2026-10-30, twice, both "r
 
 ## The claim it lets an owner test
 
-A capsule is a file. Anyone with the file, the engine image it names, and a Linux machine with bubblewrap can run `verify` offline, with no Feral File service anywhere, and get a yes or a no: the work's files are exactly what the publisher packed, and the work rendered to the same pixels the publisher recorded, inside the same engine. Without the image, `--host` compares against this machine's Chromium instead; that result is reported as a different-engine comparison, never as `reproduced`.
+A capsule is a file. Anyone with the file, the engine image it names, and a Linux machine with bubblewrap can run `verify` offline, with no Feral File service anywhere, and get a yes or a no: the work's files are exactly what the publisher packed, and the work rendered inside the same engine, with no render problems, to a frame within the tolerance the artist declared (`--tolerance N`, a dHash distance, default 4; 0 is exact pixels) of the one the publisher recorded. Exact pixels is a tolerance of 0, the artist's to ask for: whether a few pixels or a shade make a different work is a question the field has argued without resolution, and what the artist fixed is the script and its seed. The engine pin is there so the work runs at all, years out. Without the image, `--host` compares against this machine's Chromium instead; that result is reported as a different-engine comparison, never as `reproduced`.
 
 ## What it does
 
 ```
 engine/build-engine.sh 2026/10/20 out/ [exact-chromium-pkg-url]        # once per engine: content-addressed rootfs + manifest
-python3 dp1c.py build  WORKDIR --engine out/engine-<sha>.tar.zst --out work.dp1c [--entry index.html] [--title ..] [--source URL] [--provenance p.json] [--seed 0x..] [--created ISO] [--frames 60] [--pin-random SEED]
+python3 dp1c.py build  WORKDIR --engine out/engine-<sha>.tar.zst --out work.dp1c [--entry index.html] [--title ..] [--source URL] [--provenance p.json] [--seed 0x..] [--created ISO] [--frames 60] [--pin-random SEED] [--tolerance N]
 python3 dp1c.py import-capture --cache-root ~/.cache/offline-artworks --source <item.source URL> --engine out/engine-<sha>.tar.zst --out work.dp1c   # from an FF1's offline store
 tools/ff1-cast.py <ff-cli device name> downloadPlaylistItem '{"item": {...}}'   # ask an FF1 to capture a work first; then pull its ~/.cache/offline-artworks over SSH
 tools/onchfs-read.py <cid> workdir/   # read and verify an onchfs:// tree straight from the Ethereum contract (fxhash works), then build with --entry 'index.html?fxhash=0x...'
@@ -81,11 +81,11 @@ Second pass (Codex and Grok, same day, on the replay layout and the frame schedu
 
 ## Tests
 
-`python3 tests/run.py` (host mode, about ten seconds) re-measures the frame-clock claims on the six pages in `tests/pages/`: two builds of each page give identical bytes; 60 ticks are delivered and the expected callbacks run (one per frame; none on a timer-only page; 120 across a parent and its same-process iframe; one where the first callback cancels the second; one that reads `performance.now()` itself every frame, the shader case); `Date.now()` at capture is the epoch plus the settle budget plus 60 intervals; the worker page is refused naming the worker; a capsule with one byte of its entry changed is `assetsCorrupt` before any render; a host-built capsule verifies exact as `reproducedUnpinned`, exit 2; the example signature is valid with and without the library and invalid with one character flipped. Its first run found the two defects the paragraph above now guards against (the jittering callback timestamp and the random, recorded loopback port). The reference record carries what the clock did (`frameClock`: ticks, callbacks, documents), so a verifier can see it without a screenshot.
+`python3 tests/run.py` (host mode, about ten seconds) re-measures the frame-clock claims on the six pages in `tests/pages/`: two builds of each page give identical bytes; 60 ticks are delivered and the expected callbacks run (one per frame; none on a timer-only page; 120 across a parent and its same-process iframe; one where the first callback cancels the second; one that reads `performance.now()` itself every frame, the shader case); `Date.now()` at capture is the epoch plus the settle budget plus 60 intervals; the worker page is refused naming the worker; a capsule with one byte of its entry changed is `assetsCorrupt` before any render; a host-built capsule verifies exact as `reproducedUnpinned`, exit 2; the verdict function, offline, against the distances measured on the examples (a 2-bit color shift is `reproduced` at the default, an 11-bit blank is `reproMismatch`, the artist's 0 makes one bit a mismatch, render problems outrank a matching frame); the example signature is valid with and without the library and invalid with one character flipped. Its first run found the two defects the paragraph above now guards against (the jittering callback timestamp and the random, recorded loopback port). The reference record carries what the clock did (`frameClock`: ticks, callbacks, documents), so a verifier can see it without a screenshot.
 
 ## What is real and what is not
 
-Real: both layouts, the deterministic archive, the pinned engine image and its builder, the kernel-level offline render inside it with capabilities dropped, the DevTools-driven capture with pinned clock, frame clock and viewport, replay of a device capture with request interception, the three-way asset and frame checks, exact reproduction across runs and across one Chromium version step, the refusals.
+Real: both layouts, the deterministic archive, the pinned engine image and its builder, the kernel-level offline render inside it with capabilities dropped, the DevTools-driven capture with pinned clock, frame clock and viewport, replay of a device capture with request interception, the three-way asset and frame checks, the declared tolerance, exact reproduction across runs and across one Chromium version step, the refusals.
 
 Not yet real, in order of how much they matter:
 
@@ -94,7 +94,7 @@ Not yet real, in order of how much they matter:
 3. **The engine in 2036.** The image runs under bubblewrap today and would import as an OCI container. Running it under x86-64 emulation, with a pinned kernel and CPU model, is the long-term path and has not been exercised.
 4. **Who signs.** The example is signed by a prototype key generated on this laptop. Which key signs in production and where its `did:key` is published is open.
 5. **On the device.** The capture is the device's and the import is a laptop command. Capture-to-capsule and the verify loop inside feral-controld are specified in `SPEC-PROPOSAL.md` ("How this fits the device") and not built.
-6. **Which frame, and tolerance.** Frame 60 is a default, not the artist's statement; CSS animations and video run on compositor time and are not yet under the frame clock. Decisions 4 and 5.
+6. **Which frame.** Frame 60 is a default, not the artist's statement; CSS animations and video run on compositor time and are not yet under the frame clock. Decision 4. Tolerance is decided (decision 5); the artist's sign-off signature is specified in decision 1 and not built.
 
 ## Why this and not a screenshot
 

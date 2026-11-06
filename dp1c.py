@@ -32,6 +32,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "harness.py")
 CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
 ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
+# dHash distance within which a render is the work when the playlist declares no tolerance. Readings on the five
+# examples (2026-11-06): a few changed pixels, a color shift, JPEG at quality 60, a 1.5 px blur or a 2 px shift cost
+# 0..2 bits; a 5% crop costs 4..10; a blank frame costs 11..34; another work costs 13..38. 4 separates the first
+# group from the rest on every example with margin on both sides. The artist's own number, declared at build, wins.
+DEFAULT_TOLERANCE = 4
 MAX_CAPSULE_BYTES = 2 * 1024**3
 MAX_MEMBERS = 50000
 MAX_BODY = 200 * 1024 * 1024  # largest response body a replay capsule may carry (one DevTools message each)
@@ -813,6 +818,7 @@ def write_capsule(a, stage, outdir, root, version, image_ref, engine, entry, ite
             **({"seed": a.seed} if a.seed else {}),
             "assetsSHA256": [asset_hashes[k] for k in sorted(asset_hashes)],
             "frameHash": {"sha256": fh["sha256"], "phash": fh["phash"]},
+            "tolerance": a.tolerance,
         },
     }
     if a.provenance:
@@ -975,6 +981,24 @@ def cmd_import_capture(a):
         write_capsule(a, stage, outdir, root, version, image_ref, engine, rec["entry"], item_base, source, capture)
 
 
+def decide(bad, signer_ok, sigs, clean, distance, tolerance, engine_match, harness_match, pinned, same_version):
+    """The verdict, in the order the checks are decided. distance is the dHash distance between the render and the
+    reference; tolerance is the capsule's declared number (0 = exact pixels). Only 'reproduced' exits 0."""
+    if bad:
+        return "assetsCorrupt"
+    if not signer_ok:
+        return "unsigned" if not sigs else "signatureInvalid"
+    if not clean:
+        return "renderProblems"
+    if distance > tolerance:
+        return "reproMismatch"
+    if engine_match and harness_match:
+        return "reproduced"
+    if not pinned and harness_match and same_version:
+        return "reproducedUnpinned"  # the capsule names no image (built with --host): same Chromium version and harness, but nothing pinned
+    return "reproducedOnDifferentEngine"
+
+
 def cmd_verify(a):
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outdir:
         unpack(a.capsule, d)
@@ -985,8 +1009,12 @@ def cmd_verify(a):
             sys.exit("this verifier handles exactly one item per capsule")
         item = pl["items"][0]
         want = item["repro"]["frameHash"]
+        tolerance = item["repro"].get("tolerance", DEFAULT_TOLERANCE)
         # 1. assets: whole tree vs manifest vs playlist
         bad = check_assets(os.path.join(d, "assets"), ref["assets"])
+        if not isinstance(tolerance, int) or isinstance(tolerance, bool) or not 0 <= tolerance <= 64:
+            bad.append(f"playlist repro.tolerance must be an integer 0..64, got {tolerance!r}")
+            tolerance = 0
         if sorted(ref["assets"].values()) != sorted(item["repro"]["assetsSHA256"]):
             bad.append("playlist repro.assetsSHA256 disagrees with reference.json")
         # the three copies of the reference frame must agree: playlist, reference.json, and the PNG itself
@@ -1074,23 +1102,9 @@ def cmd_verify(a):
         signer_ok = True
         if a.require_signer:
             signer_ok = any(x["valid"] and x["kid"] == a.require_signer for x in sigs)
-        if bad:
-            verdict = "assetsCorrupt"
-        elif not signer_ok:
-            verdict = "unsigned" if not sigs else "signatureInvalid"
-        elif not clean:
-            verdict = "renderProblems"
-        elif exact:
-            if engine_match and harness_match:
-                verdict = "reproduced"
-            elif not pinned_img and harness_match and here_ver == engine["version"]:
-                verdict = "reproducedUnpinned"  # the capsule names no image (built with --host): same Chromium version and harness, but nothing pinned
-            else:
-                verdict = "reproducedOnDifferentEngine"
-        elif ham <= 4 and not engine_match:
-            verdict = "nearOnDifferentEngine"
-        else:
-            verdict = "reproMismatch"
+        verdict = decide(
+            bad, signer_ok, sigs, clean, ham, tolerance, engine_match, harness_match, pinned_img, here_ver == engine["version"]
+        )
         print(
             json.dumps(
                 {
@@ -1109,6 +1123,8 @@ def cmd_verify(a):
                     "frameHashHere": fh["sha256"],
                     "exact": exact,
                     "phashDistance": ham,
+                    "tolerance": tolerance,
+                    "withinTolerance": ham <= tolerance,
                     "renderProblems": problems,
                     "replayed": rj["diagnostics"].get("replayed"),
                     "framesTicked": rj["diagnostics"].get("framesTicked"),
@@ -1162,6 +1178,13 @@ def main():
         x.add_argument("--engine")
         x.add_argument("--host", action="store_true")
         x.add_argument("--allow-render-errors", action="store_true")
+        x.add_argument(
+            "--tolerance",
+            type=int,
+            default=DEFAULT_TOLERANCE,
+            metavar="N",
+            help=f"dHash distance within which a render is still the work; 0 means exact pixels (default {DEFAULT_TOLERANCE}); the artist's number",
+        )
         x.add_argument(
             "--pin-random",
             type=int,
