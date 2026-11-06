@@ -32,14 +32,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "harness.py")
 CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
 ENGINE_CACHE = os.path.expanduser("~/.cache/dp1c/engines")
-# dHash distance within which a render is the work when the playlist declares no tolerance, applied to both the
-# recorded horizontal hash and the vertical one computed at verify. Readings on the five examples (2026-11-06),
-# horizontal/vertical bits: JPEG at quality 60, a 1.5 px blur, gamma 0.8, a 2 px shift cost 0..2 on dense works and up
-# to 3 on the sparse ones; a 10% brightness or 40% saturation change costs up to 4/6 on Digital Soul, the sparsest; a
-# 5% crop costs 4..10 horizontally; a blank frame 11..34; a mirrored or halves-swapped frame 4..38 horizontally but
-# 3..38 vertically, with Fidenza at 4/15 and 5/28, which is why the vertical hash is checked at all. 3 is between the
-# engine-sized differences and the rest on these frames; the margins are thin on sparse works, and the artist's
-# contact sheet, not this constant, is where a work's number is found. The artist's number wins.
+# dHash distance within which a render is the work when the playlist declares no tolerance, applied to the larger of
+# the row distance (recorded phash) and the column distance (dhash_v, computed at verify). The readings are
+# tools/readings.py, run on the five examples' reference frames; quoted in SPEC-PROPOSAL.md §5. In short: JPEG at
+# quality 60, a 1.5 px blur and a 2 px shift cost at most 3 bits on any of the five; brightness, saturation and gamma
+# changes reach 4 to 6 on the sparse works; a flipped, rotated or halves-swapped frame costs at least 4 (Prodigy
+# rotated 180 is 4/4, Fidenza mirrored 4/15); a blank at least 11; another work at least 13. 3 is the largest value
+# under every flipped reading, with one bit of margin on symmetric and sparse works. The artist's number wins.
 DEFAULT_TOLERANCE = 3
 MAX_CAPSULE_BYTES = 2 * 1024**3
 MAX_MEMBERS = 50000
@@ -500,10 +499,10 @@ def dhash(im, size=8):
 
 
 def dhash_v(im, size=8):
-    """The same difference hash down the columns: 8x9, bit = upper pixel > lower pixel. Computed at verify from the
-    reference PNG and the render, never recorded in the playlist, so the §5 phash field keeps its definition. It sees
-    what the row hash cannot: a frame flipped or with its halves swapped keeps most row gradients and reverses the
-    column ones."""
+    """The same difference hash down the columns: 8x9, bit = upper pixel > lower pixel. Recorded in reference.json's
+    frame record for new builds and recomputed at verify from the reference PNG regardless, so older capsules verify
+    the same way and the playlist's §5 phash field keeps its definition. It sees what the row hash cannot: a frame
+    flipped or with its halves swapped keeps most row gradients and reverses the column ones."""
     g = im.convert("L").resize((size, size + 1), Image.LANCZOS)
     px = list(g.get_flattened_data()) if hasattr(g, "get_flattened_data") else list(g.getdata())
     bits = "".join(
