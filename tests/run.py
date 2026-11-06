@@ -220,6 +220,17 @@ check("sheet: reference tile is exact", kinds["capsule"]["exact"] is True)
 check("sheet: host render tile is exact on the machine that built it", kinds["render"]["exact"] is True, str(kinds["render"]))
 check("sheet: the probe is not exact and its distances are reported", kinds["probe"]["exact"] is False and "rows" in kinds["probe"], str(kinds["probe"]))
 check("sheet: tolerance carried", sj["tolerance"] == T)
+small = os.path.join(out, "small.png")
+Image.open(sheet_png).resize((96, 54)).save(small)  # any picture of another size
+run("sheet", clean, "--tile", f"small={small}", "--no-probe", "--out", os.path.join(out, "sheet2.png"))
+sj2 = json.load(open(os.path.join(out, "sheet2.png.json")))
+ft = [t for t in sj2["tiles"] if t["kind"] == "file"][0]
+check("sheet: a tile of another size is marked resized and never exact", ft["resized"] is True and ft["exact"] is False and "resized" in ft["label"])
+r = run("sheet", tampered, "--out", os.path.join(out, "sheet3.png"), ok=False)
+check("sheet: a capsule that fails the static checks gets no sheet", r.returncode != 0 and "static checks" in (r.stdout + r.stderr))
+r = run("sheet", recorded, "--out", os.path.join(out, "sheet4.png"), ok=False)
+sj4 = json.load(open(os.path.join(out, "sheet4.png.json")))
+check("sheet: problems recorded at build ride the reference tile and void its verdict", any(sj4["tiles"][0]["renderProblems"].values()) and sj4["tiles"][0]["withinTolerance"] is False)
 
 # web3:// URL parsing (ERC-4804 auto mode), offline
 import importlib.util

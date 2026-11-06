@@ -677,7 +677,8 @@ def cmd_sign(a):
     doc = json.load(open(side)) if os.path.exists(side) else {"capsuleId": cid, "signatures": []}
     if doc.get("capsuleId") != cid:
         sys.exit(f"{side} belongs to a different capsule ({doc.get('capsuleId')})")
-    doc["signatures"] = [x for x in doc["signatures"] if x["kid"] != entry["kid"]] + [entry]
+    # a later signature by the same key is a new witness, kept beside the earlier one; only an identical entry is dropped
+    doc["signatures"] = [x for x in doc["signatures"] if x.get("sig") != entry["sig"]] + [entry]
     open(side, "w").write(canon(doc))
     print(json.dumps({"capsuleId": cid, "sidecar": side, "kid": entry["kid"], "role": a.role}, indent=2))
 
@@ -1197,18 +1198,42 @@ def cmd_sheet(a):
         pl = json.load(open(os.path.join(d, "playlist.json")))
         engine = json.load(open(os.path.join(d, "meta", "engine", "chromium.json")))
         ref = json.load(open(os.path.join(d, "meta", "render", "reference.json")))
+        if len(pl.get("items", [])) != 1:
+            sys.exit("this tool handles exactly one item per capsule")
         item = pl["items"][0]
+        want = item["repro"]["frameHash"]
         tolerance = item["repro"].get("tolerance", DEFAULT_TOLERANCE)
-        ref_bytes = open(os.path.join(d, "meta", "render", "reference.png"), "rb").read()
+        png_path = os.path.join(d, "meta", "render", "reference.png")
+        if not os.path.isfile(png_path):
+            sys.exit("capsule has no meta/render/reference.png")
+        ref_bytes = open(png_path, "rb").read()
         ref_fh = frame_hash(ref_bytes, engine["viewport"])
         ref_im = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
         assets = os.path.join(d, "assets")
-        replay = None
+        # the same static checks verify runs; a sheet of an inconsistent capsule would look trustworthy and be worthless
+        bad = check_assets(assets, ref["assets"])
+        if sorted(ref["assets"].values()) != sorted(item["repro"]["assetsSHA256"]):
+            bad.append("playlist repro.assetsSHA256 disagrees with reference.json")
+        if not (ref_fh["sha256"] == ref["frame"]["sha256"] == want["sha256"] and ref_fh["phash"] == ref["frame"]["phash"] == want["phash"]):
+            bad.append("reference frame records disagree (playlist / reference.json / reference.png)")
+        bad += check_pin(engine)
+        if not isinstance(tolerance, int) or isinstance(tolerance, bool) or not 0 <= tolerance <= 64:
+            bad.append(f"playlist repro.tolerance must be an integer 0..64, got {tolerance!r}")
+        replay, capture = None, None
         if ref.get("mode") == "replay":
-            capture = json.load(open(os.path.join(d, "meta", "capture", "resources.json")))
+            cp = os.path.join(d, "meta", "capture", "resources.json")
+            if not os.path.isfile(cp):
+                sys.exit("replay capsule has no meta/capture/resources.json")
+            capture = json.load(open(cp))
+            bad += check_capture(capture, ref["assets"])
             replay = {"entry": capture["entry"], "resources": capture["resources"]}
+        elif ref.get("mode", "files") != "files":
+            bad.append("unknown mode " + str(ref.get("mode")))
+        if bad:
+            sys.exit("capsule fails its static checks; no sheet:\n" + "\n".join(bad))
+        recorded = ref.get("problems") or {}
         run_engine = {**engine, "flags": list(DETERMINISTIC_FLAGS), "env": dict(SANDBOX_ENV)}
-        tiles = [("reference, as recorded", ref_im, "capsule")]
+        tiles = [("reference, as recorded", ref_im, "capsule", dict(recorded))]
         pinned_img = (engine.get("imageRef") or {}).get("sha256")
         root = None
         if a.engine:
@@ -1220,44 +1245,56 @@ def cmd_sheet(a):
             os.makedirs(o)
             png, rj = render(root, assets, ref["entry"], run_engine, o, replay)
             same = here_img == pinned_img
+            probs = render_problems(rj)
+            if capture:
+                probs["replay"] = replay_problems(rj, capture)
             tiles.append(
                 (
                     f"pinned engine image, Chromium {engine_version(root)}, software raster" + ("" if same else " (not the capsule's image)"),
                     Image.open(io.BytesIO(png)).convert("RGB"),
                     "render",
+                    probs,
                 )
             )
         if a.host:
             o = os.path.join(outdir, "host")
             os.makedirs(o)
             png, rj = render(None, assets, ref["entry"], run_engine, o, replay)
-            tiles.append((f"this machine, Chromium {host_version()}, software raster", Image.open(io.BytesIO(png)).convert("RGB"), "render"))
+            probs = render_problems(rj)
+            if capture:
+                probs["replay"] = replay_problems(rj, capture)
+            tiles.append((f"this machine, Chromium {host_version()}, software raster", Image.open(io.BytesIO(png)).convert("RGB"), "render", probs))
         for spec in a.tile or []:
             label, _, path = spec.partition("=")
             if not path:
                 sys.exit(f"--tile wants LABEL=PATH, got {spec!r}")
-            tiles.append((label, Image.open(path).convert("RGB"), "file"))
+            tiles.append((label, Image.open(path).convert("RGB"), "file", {}))
         if not a.no_probe:
-            tiles.append(("probe: the reference with brightness x1.1 (is color part of the work?)", ImageEnhance.Brightness(ref_im).enhance(1.1), "probe"))
+            tiles.append(("probe: the reference with brightness x1.1 (is color part of the work?)", ImageEnhance.Brightness(ref_im).enhance(1.1), "probe", {}))
         rows = []
-        for label, im, kind in tiles:
-            note = ""
-            if im.size != ref_im.size:
-                note = f" (resized from {im.width}x{im.height})"
+        for label, im, kind, probs in tiles:
+            resized = im.size != ref_im.size
+            if resized:
+                # measured after a resize to the reference's size: the distances are of the resized picture, and a
+                # pixel match is not claimed for a frame of another size
+                label += f" (resized from {im.width}x{im.height}; distances are of the resized frame)"
                 im = im.resize(ref_im.size, Image.LANCZOS)
             buf = io.BytesIO()
             im.save(buf, "PNG")
             fh = frame_hash(buf.getvalue(), engine["viewport"])
             dh, dv = hamming(fh["phash"], ref_fh["phash"]), hamming(fh["phashV"], ref_fh["phashV"])
-            exact = fh["sha256"] == ref_fh["sha256"]
+            exact = fh["sha256"] == ref_fh["sha256"] and not resized
+            clean = not any(probs.values())
             rows.append(
                 {
-                    "label": label + note,
+                    "label": label,
                     "kind": kind,
                     "exact": exact,
+                    "resized": resized,
                     "rows": dh,
                     "columns": dv,
-                    "withinTolerance": within_tolerance(exact, max(dh, dv), tolerance),
+                    "renderProblems": probs,
+                    "withinTolerance": clean and within_tolerance(exact, max(dh, dv), tolerance),
                     "sha256": fh["sha256"],
                     "image": im,
                 }
@@ -1283,7 +1320,10 @@ def cmd_sheet(a):
             x = pad + (i % cols) * (tw + pad)
             y = 56 + (i // cols) * (th + cap_h + pad)
             sheet.paste(r["image"].resize((tw, th), Image.LANCZOS), (x, y))
-            verdict = "exact" if r["exact"] else (f"within {tolerance}" if r["withinTolerance"] else f"over {tolerance}")
+            if any(r["renderProblems"].values()):
+                verdict = "render problems: " + ", ".join(k for k, v in r["renderProblems"].items() if v)
+            else:
+                verdict = "exact" if r["exact"] else (f"within {tolerance}" if r["withinTolerance"] else f"over {tolerance}")
             draw.text((x, y + th + 6), r["label"], fill=(20, 20, 20), font=small)
             draw.text((x, y + th + 28), f"rows {r['rows']}  columns {r['columns']}  {verdict}", fill=(20, 20, 20) if r["withinTolerance"] else (160, 20, 20), font=small)
         sheet.save(a.out, "PNG")
