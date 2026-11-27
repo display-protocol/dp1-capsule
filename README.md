@@ -105,3 +105,7 @@ Not yet real, in order of how much they matter:
 ## Why this and not a screenshot
 
 A screenshot proves what the publisher saw. A capsule lets the owner re-derive it, inside the same engine, with nothing else reachable. The difference is what has to be trusted: the file and the image, not the publisher.
+
+## License
+
+The code is under the Mozilla Public License 2.0 (`LICENSE`), as the other DP-1 tools are. The works in `examples/` are their artists'; that license does not cover them.
